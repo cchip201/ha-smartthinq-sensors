@@ -197,6 +197,8 @@ class CoreAsync:
         self._timeout = aiohttp.ClientTimeout(total=timeout)
         self._oauth_url = oauth_url
         self._client_id = client_id
+        self._registered_client_id: str | None = None
+        self._client_reg_lock = asyncio.Lock()
         self._update_clientid_callback = update_clientid_callback
         self._lang_pack_url = None
 
@@ -250,14 +252,89 @@ class CoreAsync:
 
         hash_object = hashlib.sha256()
         hash_object.update(
-            (user_number + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")).encode(
-                "utf8"
-            )
+            (
+                user_number
+                + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+                + gen_uuid()
+            ).encode("utf8")
         )
         self._client_id = hash_object.hexdigest()
         if self._update_clientid_callback is not None:
             self._update_clientid_callback(self._client_id)
         return self._client_id
+
+    async def _ensure_client_registered(
+        self,
+        url: str,
+        access_token: str | None,
+        user_number: str | None,
+        *,
+        failed_client_id: str | None = None,
+    ) -> str | None:
+        """Register x-client-id via POST /service/users/client so APIv2 GET and control-sync succeed."""
+        if (
+            not access_token
+            or not user_number
+            or "/service/" not in url
+            or url.endswith("/service/users/client")
+        ):
+            return self._get_client_id(user_number)
+
+        async with self._client_reg_lock:
+            if (
+                failed_client_id is None
+                and self._client_id
+                and self._registered_client_id == self._client_id
+            ):
+                return self._client_id
+            if (
+                failed_client_id is not None
+                and self._client_id
+                and self._client_id != failed_client_id
+                and self._registered_client_id == self._client_id
+            ):
+                return self._client_id
+
+            reg_url = url.split("/service/", 1)[0] + "/service/users/client"
+            payload = {
+                "type": V2_APP_TYPE,
+                "countryCode": self._country,
+                "langCode": self._language,
+            }
+            need_fresh = failed_client_id is not None and (
+                self._client_id is None or self._client_id == failed_client_id
+            )
+            for attempt in range(2):
+                cid = self._get_client_id(
+                    user_number, force_refresh=(need_fresh or attempt > 0)
+                )
+                async with self._get_session().post(
+                    url=reg_url,
+                    json=payload,
+                    headers=self._thinq2_headers(
+                        client_id=cid,
+                        access_token=access_token,
+                        user_number=user_number,
+                        country=self._country,
+                        language=self._language,
+                        security_key=False,
+                    ),
+                    timeout=self._timeout,
+                    raise_for_status=False,
+                ) as resp:
+                    out = await self._get_json_resp(resp)
+
+                code = out.get("resultCode")
+                if code == "0000":
+                    self._registered_client_id = cid
+                    _LOGGER.debug("Registered ThinQ APIv2 client ID")
+                    return cid
+
+                if code not in ("9006", "9012"):
+                    _LOGGER.debug("ThinQ users/client returned resultCode=%s", code)
+                    return cid
+
+            return self._client_id
 
     @staticmethod
     async def _get_json_resp(response: aiohttp.ClientResponse) -> dict:
@@ -356,28 +433,44 @@ class CoreAsync:
 
         _LOGGER.debug("thinq2_get before: %s", url)
 
-        client_id = self._get_client_id(user_number)
-        async with self._get_session().get(
-            url=url,
-            headers=self._thinq2_headers(
-                client_id=client_id,
-                access_token=access_token,
-                user_number=user_number,
-                extra_headers=headers or {},
-                country=self._country,
-                language=self._language,
-            ),
-            timeout=self._timeout,
-            raise_for_status=False,
-        ) as resp:
-            out = await self._get_json_resp(resp)
+        failed_cid: str | None = None
+        for attempt in range(2):
+            client_id = await self._ensure_client_registered(
+                url, access_token, user_number, failed_client_id=failed_cid
+            )
+            async with self._get_session().get(
+                url=url,
+                headers=self._thinq2_headers(
+                    client_id=client_id,
+                    access_token=access_token,
+                    user_number=user_number,
+                    extra_headers=headers or {},
+                    country=self._country,
+                    language=self._language,
+                ),
+                timeout=self._timeout,
+                raise_for_status=False,
+            ) as resp:
+                out = await self._get_json_resp(resp)
 
-        _LOGGER.debug("thinq2_get after: %s", out)
+            _LOGGER.debug("thinq2_get after: %s", out)
 
-        if "resultCode" not in out:
-            raise exc.APIError("-1", out)
+            if "resultCode" not in out:
+                raise exc.APIError("-1", out)
 
-        return self._manage_lge_result(out, True, user_number)
+            try:
+                return self._manage_lge_result(out, True, user_number)
+            except exc.UseOfficialAPIError:
+                if attempt == 0 and access_token and user_number and "/service/" in url:
+                    _LOGGER.info(
+                        "Re-registering ThinQ client ID after %s on GET",
+                        out.get("resultCode"),
+                    )
+                    failed_cid = client_id or V2_CLIENT_ID
+                    continue
+                raise
+
+        raise RuntimeError("unreachable")
 
     async def lgedm2_post(
         self,
@@ -392,27 +485,53 @@ class CoreAsync:
 
         _LOGGER.debug("lgedm2_post before: %s", url)
 
-        client_id = self._get_client_id(user_number)
-        async with self._get_session().post(
-            url=url,
-            json=data if is_api_v2 else {DATA_ROOT: data},
-            headers=self._thinq2_headers(
-                client_id=client_id,
-                access_token=access_token,
-                user_number=user_number,
-                extra_headers=headers or {},
-                country=self._country,
-                language=self._language,
-                security_key=True,
-            ),
-            timeout=self._timeout,
-            raise_for_status=False,
-        ) as resp:
-            out = await self._get_json_resp(resp)
+        failed_cid: str | None = None
+        for attempt in range(2):
+            if is_api_v2:
+                client_id = await self._ensure_client_registered(
+                    url, access_token, user_number, failed_client_id=failed_cid
+                )
+            else:
+                client_id = self._get_client_id(user_number)
 
-        _LOGGER.debug("lgedm2_post after: %s", out)
+            async with self._get_session().post(
+                url=url,
+                json=data if is_api_v2 else {DATA_ROOT: data},
+                headers=self._thinq2_headers(
+                    client_id=client_id,
+                    access_token=access_token,
+                    user_number=user_number,
+                    extra_headers=headers or {},
+                    country=self._country,
+                    language=self._language,
+                    security_key=True,
+                ),
+                timeout=self._timeout,
+                raise_for_status=False,
+            ) as resp:
+                out = await self._get_json_resp(resp)
 
-        return self._manage_lge_result(out, is_api_v2, user_number)
+            _LOGGER.debug("lgedm2_post after: %s", out)
+
+            try:
+                return self._manage_lge_result(out, is_api_v2, user_number)
+            except exc.UseOfficialAPIError:
+                if (
+                    is_api_v2
+                    and attempt == 0
+                    and access_token
+                    and user_number
+                    and "/service/" in url
+                ):
+                    _LOGGER.info(
+                        "Re-registering ThinQ client ID after %s on POST",
+                        out.get("resultCode"),
+                    )
+                    failed_cid = client_id or V2_CLIENT_ID
+                    continue
+                raise
+
+        raise RuntimeError("unreachable")
 
     def _manage_lge_result(
         self, result: dict, is_api_v2=False, user_number: str | None = None
@@ -423,15 +542,14 @@ class CoreAsync:
             if "resultCode" in result:
                 code = result["resultCode"]
                 if code != "0000":
+                    raw_msg = result.get("result")
                     if code in ("9006", "9012"):
-                        # this are messages "Please consider using the official API" or "consider using native API"
-                        # we refresh the client_id as work-around
-                        _LOGGER.info(
-                            "Refreshing client ID after receiving msg 9006 or 9012: %s",
-                            result,
-                        )
-                        self._get_client_id(user_number, True)
-                    message = result.get("result") or "ThinQ APIv2 error"
+                        if isinstance(raw_msg, dict):
+                            raise exc.FailedRequestError(
+                                "ThinQ APIv2 control request rejected", code
+                            )
+                        self._registered_client_id = None
+                    message = raw_msg or "ThinQ APIv2 error"
                     if code in API2_ERRORS:
                         raise API2_ERRORS[code](message)
                     raise exc.APIError(message, code)

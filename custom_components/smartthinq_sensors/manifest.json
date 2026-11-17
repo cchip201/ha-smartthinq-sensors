@@ -1,7 +1,9 @@
 {
   "domain": "smartthinq_sensors",
   "name": "SmartThinQ LGE Sensors",
-  "codeowners": ["@ollo69"],
+  "codeowners": [
+    "@ollo69"
+  ],
   "config_flow": true,
   "dependencies": [],
   "documentation": "https://github.com/ollo69/ha-smartthinq-sensors",
@@ -13,5 +15,5 @@
     "xmltodict>=0.13.0",
     "charset_normalizer>=3.2.0"
   ],
-  "version": "0.43.0"
+  "version": "0.43.0-cmcore.1"
 }

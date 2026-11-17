@@ -229,10 +229,10 @@ class LGEWashDevice(LGEBaseDevice):
         if self._api.state:
             if self._api.state.is_on:
                 course = self._api.state.current_course
-                if course:
+                if course and course != StateOptions.NONE:
                     return course
                 smart_course = self._api.state.current_smartcourse
-                if smart_course:
+                if smart_course and smart_course != StateOptions.NONE:
                     return smart_course
         return "-"
 

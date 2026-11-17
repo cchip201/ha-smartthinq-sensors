@@ -83,6 +83,7 @@ class CourseType(IntEnum):
     COURSE = 0
     SMARTCOURSE = 1
     OPCOURSE = 2
+    DOWNLOADEDCOURSE = 3
 
 
 _COURSE_KEYS = {
@@ -92,9 +93,23 @@ _COURSE_KEYS = {
         ["SmartCourse"],
         ["smartCourseType", "downloadedCourseType"],
     ],
+    CourseType.DOWNLOADEDCOURSE: [
+        ["SmartCourse"],
+        ["downloadedCourseType", "smartCourseType"],
+    ],
 }
 _COURSE_TYPE = "courseType"
 _CURRENT_COURSE = "Current course"
+_DOWNLOAD_DEFAULT_LABEL = "Downloaded"
+_DOWNLOAD_SLOT_SENTINEL = "__SMARTCOURSE_SLOT__"
+_DOWNLOAD_SKIP_KEYS = {
+    "Course",
+    "APCourse",
+    "ApCourse",
+    "SmartCourse",
+    "smartCourse",
+    "OpCourse",
+}
 
 
 class WMDevice(Device):
@@ -124,7 +139,9 @@ class WMDevice(Device):
         self._is_run_completed = False
         self._course_keys: dict[CourseType, str | None] | None = None
         self._course_infos: dict[str, str] | None = None
+        self._smartcourse_infos: dict[str, str] | None = None
         self._selected_course: str | None = None
+        self._downloaded_course_override: str | None = None
         self._is_cycle_finishing = False
         self._stand_by = False
         self._remote_start_status: dict | None = None
@@ -158,6 +175,16 @@ class WMDevice(Device):
         return self._subkey_device
 
     @cached_property
+    def _download_panel_label(self) -> str:
+        """Return localized label for the Downloaded dial slot."""
+        if self.model_info:
+            if label_key := self.model_info.config_value("downloadPanelLabel"):
+                text = self.get_enum_text(label_key)
+                if text and text != label_key and not str(text).startswith("@"):
+                    return str(text)
+        return _DOWNLOAD_DEFAULT_LABEL
+
+    @cached_property
     def course_list(self) -> list:
         """Return a list of available course."""
         course_infos = self._get_course_infos()
@@ -167,6 +194,50 @@ class WMDevice(Device):
     def selected_course(self) -> str:
         """Return current selected course."""
         return self._selected_course or _CURRENT_COURSE
+
+    @property
+    def has_downloaded_courses(self) -> bool:
+        """Return True if device model defines downloadable SmartCourse entries."""
+        return bool(self._get_smartcourse_infos())
+
+    @cached_property
+    def downloaded_course_list(self) -> list[str]:
+        """Return list of downloadable SmartCourse display names."""
+        return list(self._get_smartcourse_infos().keys())
+
+    def _current_downloaded_course_id(self) -> str | None:
+        """Return the SmartCourse ID currently stored in the device's Downloaded slot."""
+        smart_map = self._get_smartcourse_infos()
+        valid_ids = set(smart_map.values())
+        if not valid_ids:
+            return None
+
+        data = self._status.as_dict if self._status else None
+        if data:
+            for ct in (CourseType.DOWNLOADEDCOURSE, CourseType.SMARTCOURSE):
+                ckey = self.get_course_key(ct)
+                if ckey and (val := data.get(ckey)) and str(val) in valid_ids:
+                    return str(val)
+
+        if self._downloaded_course_override in valid_ids:
+            return self._downloaded_course_override
+
+        if self.model_info:
+            default_sc = self.model_info.config_value("defaultSmartCourse")
+            if default_sc and str(default_sc) in valid_ids:
+                return str(default_sc)
+        return None
+
+    @property
+    def downloaded_course(self) -> str | None:
+        """Return display name of the SmartCourse currently stored in the Downloaded slot."""
+        smart_id = self._current_downloaded_course_id()
+        if not smart_id:
+            return None
+        for name, cid in self._get_smartcourse_infos().items():
+            if cid == smart_id:
+                return name
+        return None
 
     @property
     def run_state(self) -> str:
@@ -322,6 +393,40 @@ class WMDevice(Device):
             self._course_keys = {key: self._get_course_key(key) for key in _COURSE_KEYS}
         return self._course_keys[course_type]
 
+    def _get_smartcourse_infos(self) -> dict[str, str]:
+        """Return a dict of downloadable SmartCourse display names to IDs."""
+        if self._smartcourse_infos is not None:
+            return self._smartcourse_infos
+
+        if not self.model_info:
+            self._smartcourse_infos = {}
+            return {}
+        s_course_key = self.get_course_key(CourseType.SMARTCOURSE)
+        if not s_course_key:
+            self._smartcourse_infos = {}
+            return {}
+        smart_courses = self.model_info.reference_values(s_course_key)
+        if not smart_courses:
+            self._smartcourse_infos = {}
+            return {}
+
+        ret_val: dict[str, str] = {}
+        for key, value in smart_courses.items():
+            if not isinstance(value, dict):
+                continue
+            if value.get("downloadEnable") is False:
+                continue
+            if enum_name := value.get("name"):
+                name = self.get_enum_text(enum_name)
+                if name == enum_name or str(name).startswith("@"):
+                    name = value.get("_comment", enum_name)
+            else:
+                name = value.get("_comment", key)
+            ret_val[name] = key
+
+        self._smartcourse_infos = ret_val
+        return ret_val
+
     def _get_course_infos(self) -> dict:
         """Return a dict with available courses."""
         if self._course_infos is not None:
@@ -334,15 +439,30 @@ class WMDevice(Device):
             self._course_infos = {}
             return {}
 
+        dl_ap_id = (
+            self.model_info.config_value("downloadCourseAPId")
+            if self.model_info
+            else None
+        ) or "DOWNLOAD"
+        has_dl_entry = False
         ret_val = {}
         for key, value in course_infos.items():
+            if key == dl_ap_id:
+                has_dl_entry = True
             if enum_name := value.get("name"):
                 name = self.get_enum_text(enum_name)
-                if name == enum_name:
+                if name == enum_name or str(name).startswith("@"):
                     name = value.get("_comment", enum_name)
+            elif key == dl_ap_id:
+                name = self._download_panel_label
             else:
                 name = value.get("_comment", key)
             ret_val[name] = key
+
+        if not has_dl_entry and self._get_smartcourse_infos():
+            dl_label = self._download_panel_label
+            if dl_label not in ret_val:
+                ret_val[dl_label] = _DOWNLOAD_SLOT_SENTINEL
 
         self._course_infos = ret_val
         return ret_val
@@ -399,7 +519,7 @@ class WMDevice(Device):
             elif self.model_info.is_info_v2:
                 ret_data.pop(op_course_key, None)
 
-        for func_key in course_info["function"]:
+        for func_key in course_info.get("function", []):
             ckey = func_key.get("value")
             cdata = func_key.get("default")
             if not ckey or cdata is None:
@@ -450,6 +570,12 @@ class WMDevice(Device):
         else:
             def_course_id = str(self.model_info.config_value("defaultCourseId"))
 
+        dl_ap_id = (
+            self.model_info.config_value("downloadCourseAPId")
+            if self.model_info
+            else None
+        ) or "DOWNLOAD"
+
         # Search valid course Info
         if self._selected_course:
             course_id = self._get_course_infos().get(self._selected_course)
@@ -462,12 +588,33 @@ class WMDevice(Device):
             for course_key in [n_course_key, s_course_key]:
                 if not course_key:
                     continue
-                course_id = str(data.get(course_key))
+                raw_id = str(data.get(course_key))
+                if course_key == n_course_key and raw_id == dl_ap_id and s_course_key:
+                    smart_id = self._current_downloaded_course_id()
+                    if smart_id and (
+                        sc_info := self._get_course_details(s_course_key, smart_id)
+                    ):
+                        course_id = smart_id
+                        course_info = sc_info
+                        course_type = CourseType.SMARTCOURSE
+                        course_set = True
+                        break
+                course_id = raw_id
                 if course_info := self._get_course_details(course_key, course_id):
                     if course_key == s_course_key:
                         course_type = CourseType.SMARTCOURSE
                     course_set = True
                     break
+        elif course_id in (dl_ap_id, _DOWNLOAD_SLOT_SENTINEL) and s_course_key:
+            smart_id = self._current_downloaded_course_id()
+            if smart_id and (
+                sc_info := self._get_course_details(s_course_key, smart_id)
+            ):
+                course_id = smart_id
+                course_info = sc_info
+                course_type = CourseType.SMARTCOURSE
+            elif course_id != _DOWNLOAD_SLOT_SENTINEL:
+                course_info = self._get_course_details(n_course_key, course_id)
         else:
             course_info = self._get_course_details(n_course_key, course_id)
 
@@ -494,7 +641,7 @@ class WMDevice(Device):
         vt_cmd_data = []
         course_data = self._update_course_info()
         if course_info := course_data.get(VT_CTRL_COURSE_INFO):
-            for func_key in course_info["function"]:
+            for func_key in course_info.get("function", []):
                 ckey = func_key.get("value")
                 defdata = func_key.get("default")
                 cdata = course_data.get(ckey, defdata)
@@ -560,7 +707,9 @@ class WMDevice(Device):
                 if cmd_key in ["course", "Course", "ApCourse"]:
                     course_data = status_data.get(n_course_key, 0)
                     cmd_data_set[n_course_key] = course_data or "NOT_SELECTED"
-                elif cmd_key in ["smartCourse", "SmartCourse"]:
+                elif cmd_key in ["smartCourse", "SmartCourse"] or (
+                    s_course_key and cmd_key == s_course_key
+                ):
                     if s_course_key:
                         course_data = status_data.get(s_course_key, 0)
                         cmd_data_set[s_course_key] = course_data or "NOT_SELECTED"
@@ -598,11 +747,61 @@ class WMDevice(Device):
 
         cmd_data_set = {}
         vt_cmd_data = []
-        if self._initial_bit_start and command == "WMStart":
-            if vt_course_data := self._prepare_vtctrl_course_info():
-                vt_cmd_data = vt_course_data
+        if command == "WMStart" and self.model_info.config_value("uniProtocol"):
+            is_paused = (
+                not self._initial_bit_start
+                and self._status is not None
+                and self._status.internal_run_state == self._state_pause
+            )
+            ctrl_val = "RESUME" if is_paused else "START"
+            if self._initial_bit_start and self._selected_course:
+                dl_ap_id = self.model_info.config_value("downloadCourseAPId") or "DOWNLOAD"
+                c_id = self._get_course_infos().get(self._selected_course)
+                if c_id in (dl_ap_id, _DOWNLOAD_SLOT_SENTINEL):
+                    smart_id = self._current_downloaded_course_id()
+                    s_key = self.get_course_key(CourseType.SMARTCOURSE)
+                    sc_info = (
+                        self._get_course_details(s_key, smart_id)
+                        if (s_key and smart_id)
+                        else None
+                    )
+                    vt_cmd_data.append(
+                        {"cmd": "course", "type": "ABSOLUTE", "value": str(dl_ap_id)}
+                    )
+                    if smart_id and sc_info:
+                        vt_cmd_data.append(
+                            {
+                                "cmd": "downloadCourseData",
+                                "type": "ABSOLUTE",
+                                "value": str(smart_id),
+                            }
+                        )
+                        base_c = (
+                            sc_info.get("Course")
+                            or sc_info.get("APCourse")
+                            or self.model_info.config_value("defaultCourse")
+                        )
+                        if base_c:
+                            vt_cmd_data.append(
+                                {
+                                    "cmd": "baseDownloadCourseData",
+                                    "type": "ABSOLUTE",
+                                    "value": str(base_c),
+                                }
+                            )
+                elif c_id:
+                    vt_cmd_data.append(
+                        {"cmd": "course", "type": "ABSOLUTE", "value": str(c_id)}
+                    )
+            vt_cmd_data.append(
+                {"cmd": "wmControl", "type": "ABSOLUTE", "value": ctrl_val}
+            )
+        else:
+            if self._initial_bit_start and command == "WMStart":
+                if vt_course_data := self._prepare_vtctrl_course_info():
+                    vt_cmd_data = vt_course_data
 
-        vt_cmd_data.append(VT_CTRL_CMD[command])
+            vt_cmd_data.append(VT_CTRL_CMD[command])
 
         ctrl_target = None if not self._sub_device else self._sub_device.upper()
         for cmd_key, cmd_val in data_set.items():
@@ -697,6 +896,184 @@ class WMDevice(Device):
             self._selected_course = None
         return enabled
 
+    @property
+    def download_course_enabled(self) -> bool:
+        """Return True if downloading a SmartCourse into the device slot is allowed."""
+        if not (self.has_downloaded_courses and self._status and self.model_info):
+            return False
+        child_lock = self._status.device_features.get(WashDeviceFeatures.CHILDLOCK)
+        if child_lock is None:
+            cl_key = "childLock" if self.model_info.is_info_v2 else "ChildLock"
+            child_lock = self._status.lookup_bit(
+                self.getkey(cl_key), sub_key=self._sub_key
+            )
+        if child_lock == StateOptions.ON:
+            return False
+        if not self._status.is_on:
+            return bool(
+                self.model_info.is_info_v2
+                and self.model_info.config_value("powerOffDownload")
+                and not self.stand_by
+            )
+        if self._status.internal_run_state == self._state_power_on_init:
+            return True
+        if self._status.internal_run_state == self._state_pause:
+            return self.model_info.config_value("changeCourseInPause") is not False
+        return False
+
+    async def _send_download_course(self, smart_id: str, course_info: dict) -> None:
+        """Send ThinQ2 download command (vtCtrl on uniProtocol, else WMDownload)."""
+        if not self.model_info or not self.model_info.is_info_v2:
+            return
+
+        if self.model_info.config_value("uniProtocol"):
+            cmd = self.model_info.get_control_cmd("vtCtrl", "vtCtrl")
+            if not cmd:
+                raise ValueError("vtCtrl command definition not available")
+            data_set = cmd.pop("data", None) or {}
+            dl_ap_id = self.model_info.config_value("downloadCourseAPId") or "DOWNLOAD"
+            base_course = (
+                course_info.get("Course")
+                or course_info.get("APCourse")
+                or self.model_info.config_value("defaultCourse")
+            )
+            vt_cmd_data = [
+                {
+                    "cmd": "downloadCourseData",
+                    "type": "ABSOLUTE",
+                    "value": str(smart_id),
+                },
+                {"cmd": "course", "type": "ABSOLUTE", "value": str(dl_ap_id)},
+            ]
+            if base_course:
+                vt_cmd_data.append(
+                    {
+                        "cmd": "baseDownloadCourseData",
+                        "type": "ABSOLUTE",
+                        "value": str(base_course),
+                    }
+                )
+            for func_key in course_info.get("function", []):
+                ckey = func_key.get("value")
+                defdata = func_key.get("default")
+                if not ckey or defdata is None:
+                    continue
+                out_key = "reserveTimeMinute" if ckey == "reserveTimeHour" else ckey
+                vt_cmd_data.append(
+                    {"cmd": out_key, "type": "ABSOLUTE", "value": str(defdata)}
+                )
+
+            ctrl_target = None if not self._sub_device else self._sub_device.upper()
+            cmd_data_set = {}
+            for cmd_key, cmd_val in data_set.items():
+                if cmd_key == "ctrlTarget":
+                    cmd_data_set[cmd_key] = [ctrl_target] if ctrl_target else cmd_val
+                elif cmd_key == "reqDevType":
+                    cmd_data_set[cmd_key] = "APP"
+                elif cmd_key == "vtData":
+                    vt_data = {}
+                    for dt_key in cmd_val.keys():
+                        vt_data[ctrl_target or dt_key] = vt_cmd_data
+                    cmd_data_set[cmd_key] = vt_data
+                else:
+                    cmd_data_set[cmd_key] = cmd_val
+
+            full_cmd = {
+                **cmd,
+                "dataKey": None,
+                "dataValue": None,
+                "dataSetList": cmd_data_set,
+                "dataGetList": None,
+            }
+            await self._set_control(full_cmd)
+            return
+
+        dl_cmd_name = self._getcmdkey("WMDownload")
+        cmd = self.model_info.get_control_cmd(dl_cmd_name, dl_cmd_name)
+        if not cmd:
+            raise ValueError(f"{dl_cmd_name} command definition not available")
+        data_set = cmd.pop("data", None) or {}
+        tmpl_wd = data_set.get(WM_ROOT_DATA, {})
+
+        n_course_key = self.get_course_key(CourseType.COURSE)
+        s_course_key = self.get_course_key(CourseType.SMARTCOURSE)
+        op_course_key = self.get_course_key(CourseType.OPCOURSE)
+
+        payload: dict = {}
+        base_course = (
+            course_info.get("Course")
+            or course_info.get("APCourse")
+            or "NOT_SELECTED"
+        )
+        if n_course_key:
+            payload[n_course_key] = base_course
+        if s_course_key:
+            payload[s_course_key] = smart_id
+        if op_course_key and "OpCourse" in course_info:
+            payload[op_course_key] = course_info["OpCourse"]
+
+        for func_key in course_info.get("function", []):
+            ckey = func_key.get("value")
+            defdata = func_key.get("default")
+            if ckey and defdata is not None:
+                payload[ckey] = defdata
+
+        if not self._sub_key:
+            payload[_COURSE_TYPE] = course_info.get(_COURSE_TYPE, "SmartCourse")
+
+        for tmpl_k, tmpl_v in tmpl_wd.items():
+            if tmpl_k in _DOWNLOAD_SKIP_KEYS:
+                continue
+            if tmpl_k not in payload:
+                payload[tmpl_k] = tmpl_v
+
+        if "reserveTimeHour" in payload or "reserveTimeMinute" in payload:
+            payload["reserveTimeHour"] = 0
+            payload["reserveTimeMinute"] = 0
+
+        prefix = f"{self._sub_key.upper()}_" if self._sub_key else ""
+        payload[self.getkey("initialBit")] = f"{prefix}INITIAL_BIT_OFF"
+        rs_key = self.getkey("remoteStart")
+        cur_rs = (
+            self._status.as_dict.get(rs_key) if self._status else None
+        ) or tmpl_wd.get(rs_key, f"{prefix}REMOTE_START_OFF")
+        payload[rs_key] = cur_rs
+
+        full_cmd = {
+            **cmd,
+            "dataKey": None,
+            "dataValue": None,
+            "dataSetList": {WM_ROOT_DATA: payload},
+            "dataGetList": None,
+        }
+        await self._set_control(full_cmd)
+
+    async def select_downloaded_course(self, course_name: str) -> None:
+        """Download a SmartCourse into the device's Downloaded slot."""
+        if not self.download_course_enabled:
+            raise InvalidDeviceStatus()
+
+        smart_id = self._get_smartcourse_infos().get(course_name)
+        if not smart_id:
+            raise ValueError(f"Invalid downloaded course: {course_name}")
+        s_course_key = self.get_course_key(CourseType.SMARTCOURSE)
+        course_info = self._get_course_details(s_course_key, smart_id)
+        if not course_info:
+            raise ValueError(f"Downloaded course info not available: {course_name}")
+
+        await self._send_download_course(smart_id, course_info)
+        self._downloaded_course_override = smart_id
+
+        dl_key = self.get_course_key(CourseType.DOWNLOADEDCOURSE) or s_course_key
+        if dl_key:
+            if self._status and isinstance(self._status._data, dict):
+                self._status._data[dl_key] = smart_id
+            if isinstance(self._remote_start_status, dict):
+                self._remote_start_status[dl_key] = smart_id
+
+        if self.select_course_enabled and self._download_panel_label in self.course_list:
+            self._selected_course = self._download_panel_label
+
     async def select_start_course(self, course_name: str) -> None:
         """Select a secific course for remote start."""
         if not self.select_course_enabled:
@@ -732,7 +1109,13 @@ class WMDevice(Device):
             raise InvalidDeviceStatus()
 
         if course_name and self._initial_bit_start:
-            await self.select_start_course(course_name)
+            if (
+                course_name in self.downloaded_course_list
+                and course_name not in self.course_list
+            ):
+                await self.select_downloaded_course(course_name)
+            else:
+                await self.select_start_course(course_name)
 
         keys = self._get_cmd_keys(CMD_REMOTE_START)
         await self.set(keys[0], keys[1], key=keys[2])
@@ -991,16 +1374,29 @@ class WMStatus(DeviceStatus):
         """Return current course."""
         if not (course_key := self._device.get_course_key(CourseType.COURSE)):
             return StateOptions.NONE
+        dl_ap_id = (
+            self._device.model_info.config_value("downloadCourseAPId")
+            if self._device.model_info
+            else None
+        ) or "DOWNLOAD"
+        curr_key = self._get_data_key(course_key)
+        if curr_key and self._data.get(curr_key) == dl_ap_id:
+            smart = self.current_smartcourse
+            if smart and smart != StateOptions.NONE:
+                return smart
         course = self.lookup_reference(course_key, ref_key="name")
         return self._device.get_enum_text(course)
 
     @property
     def current_smartcourse(self):
         """Return current smartcourse."""
-        if not (course_key := self._device.get_course_key(CourseType.SMARTCOURSE)):
-            return StateOptions.NONE
-        smart_course = self.lookup_reference(course_key, ref_key="name")
-        return self._device.get_enum_text(smart_course)
+        for ct in (CourseType.SMARTCOURSE, CourseType.DOWNLOADEDCOURSE):
+            if course_key := self._device.get_course_key(ct):
+                smart_course = self.lookup_reference(course_key, ref_key="name")
+                text = self._device.get_enum_text(smart_course)
+                if text and text != StateOptions.NONE:
+                    return text
+        return StateOptions.NONE
 
     def _get_time_info(self, keys: list[str]):
         """Return time info for specific key."""

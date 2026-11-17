@@ -36,7 +36,8 @@ class ThinQSelectEntityDescription(
     """A class that describes ThinQ select entities."""
 
     available_fn: Callable[[Any], bool] | None = None
-    value_fn: Callable[[Any], str] | None = None
+    value_fn: Callable[[Any], str | None] | None = None
+    exist_fn: Callable[[Any], bool] | None = None
 
 
 WASH_DEV_SELECT: tuple[ThinQSelectEntityDescription, ...] = (
@@ -48,6 +49,16 @@ WASH_DEV_SELECT: tuple[ThinQSelectEntityDescription, ...] = (
         select_option_fn=lambda x, option: x.device.select_start_course(option),
         available_fn=lambda x: x.device.select_course_enabled,
         value_fn=lambda x: x.device.selected_course,
+    ),
+    ThinQSelectEntityDescription(
+        key="downloaded_course",
+        name="Downloaded course",
+        icon="mdi:cloud-download-outline",
+        options_fn=lambda x: x.device.downloaded_course_list,
+        select_option_fn=lambda x, option: x.device.select_downloaded_course(option),
+        available_fn=lambda x: x.device.download_course_enabled,
+        value_fn=lambda x: x.device.downloaded_course,
+        exist_fn=lambda x: x.device.has_downloaded_courses,
     ),
 )
 MICROWAVE_SELECT: tuple[ThinQSelectEntityDescription, ...] = (
@@ -79,6 +90,9 @@ def _select_exist(
     lge_device: LGEDevice, select_desc: ThinQSelectEntityDescription
 ) -> bool:
     """Check if a select exist for device."""
+    if select_desc.exist_fn is not None:
+        return select_desc.exist_fn(lge_device)
+
     if select_desc.value_fn is not None:
         return True
 

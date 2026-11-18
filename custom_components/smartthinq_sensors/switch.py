@@ -14,6 +14,7 @@ from homeassistant.components.switch import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import STATE_OFF, STATE_ON
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -22,6 +23,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from . import LGEDevice
 from .const import DOMAIN, LGE_DEVICES, LGE_DISCOVERY_NEW
 from .device_helpers import STATE_LOOKUP, LGEBaseDevice
+from .wideq.core_exceptions import InvalidDeviceStatus
 from .wideq import (
     WM_DEVICE_TYPES,
     AirConditionerFeatures,
@@ -44,6 +46,8 @@ class ThinQSwitchEntityDescription(SwitchEntityDescription):
     turn_off_fn: Callable[[Any], Awaitable[None]] | None = None
     turn_on_fn: Callable[[Any], Awaitable[None]] | None = None
     value_fn: Callable[[Any], bool] | None = None
+    exist_fn: Callable[[Any], bool] | None = None
+    post_control_refresh: bool = True
 
 
 WASH_DEV_SWITCH: tuple[ThinQSwitchEntityDescription, ...] = (
@@ -54,6 +58,36 @@ WASH_DEV_SWITCH: tuple[ThinQSwitchEntityDescription, ...] = (
         turn_off_fn=lambda x: x.device.power_off(),
         turn_on_fn=lambda x: x.device.wake_up(),
         available_fn=lambda x: x.is_power_on or x.device.stand_by,
+    ),
+    ThinQSwitchEntityDescription(
+        key="fresh_care",
+        name="Fresh care",
+        icon="mdi:refresh-auto",
+        value_fn=lambda x: x.device.get_switch_option_value("freshCare"),
+        turn_off_fn=lambda x: x.device.set_switch_option(
+            "freshCare", False, "Fresh care"
+        ),
+        turn_on_fn=lambda x: x.device.set_switch_option(
+            "freshCare", True, "Fresh care"
+        ),
+        available_fn=lambda x: x.device.course_display_enabled,
+        exist_fn=lambda x: x.device.has_option_control("freshCare", dryer_only=False),
+        post_control_refresh=False,
+    ),
+    ThinQSwitchEntityDescription(
+        key="wrinkle_care",
+        name="Wrinkle care",
+        icon="mdi:hanger",
+        value_fn=lambda x: x.device.get_switch_option_value("wrinkleCare"),
+        turn_off_fn=lambda x: x.device.set_switch_option(
+            "wrinkleCare", False, "Wrinkle care"
+        ),
+        turn_on_fn=lambda x: x.device.set_switch_option(
+            "wrinkleCare", True, "Wrinkle care"
+        ),
+        available_fn=lambda x: x.device.course_display_enabled,
+        exist_fn=lambda x: x.device.has_option_control("wrinkleCare", dryer_only=True),
+        post_control_refresh=False,
     ),
 )
 REFRIGERATOR_SWITCH: tuple[ThinQSwitchEntityDescription, ...] = (
@@ -154,6 +188,9 @@ def _switch_exist(
     lge_device: LGEDevice, switch_desc: ThinQSwitchEntityDescription
 ) -> bool:
     """Check if a switch exist for device."""
+    if switch_desc.exist_fn is not None:
+        return switch_desc.exist_fn(lge_device)
+
     if switch_desc.value_fn is not None:
         return True
 
@@ -266,18 +303,30 @@ class LGESwitch(LGEBaseSwitch):
         if self.entity_description.turn_off_fn is None:
             raise NotImplementedError()
         if self.is_on:
-            await self.entity_description.turn_off_fn(self._wrap_device)
+            try:
+                await self.entity_description.turn_off_fn(self._wrap_device)
+            except InvalidDeviceStatus as exc:
+                raise HomeAssistantError(
+                    str(exc) or "Option cannot be changed in the current device state"
+                ) from exc
             self._api.async_set_updated()
-            self._api.async_schedule_post_control_refresh()
+            if self.entity_description.post_control_refresh:
+                self._api.async_schedule_post_control_refresh()
 
     async def async_turn_on(self, **kwargs):
         """Turn the entity on."""
         if self.entity_description.turn_on_fn is None:
             raise NotImplementedError()
         if not self.is_on:
-            await self.entity_description.turn_on_fn(self._wrap_device)
+            try:
+                await self.entity_description.turn_on_fn(self._wrap_device)
+            except InvalidDeviceStatus as exc:
+                raise HomeAssistantError(
+                    str(exc) or "Option cannot be changed in the current device state"
+                ) from exc
             self._api.async_set_updated()
-            self._api.async_schedule_post_control_refresh()
+            if self.entity_description.post_control_refresh:
+                self._api.async_schedule_post_control_refresh()
 
     def _get_switch_state(self):
         """Get current switch state"""

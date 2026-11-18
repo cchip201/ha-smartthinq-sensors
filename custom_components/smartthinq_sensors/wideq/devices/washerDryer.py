@@ -110,6 +110,36 @@ _DOWNLOAD_SKIP_KEYS = {
     "smartCourse",
     "OpCourse",
 }
+_OPTION_NOT_SELECTED = "Not Selected"
+_OPTION_SWITCH_KEYS = {"freshCare", "wrinkleCare"}
+_OPTION_LABEL_FALLBACKS = {
+    "@WM_TERM_NO_SELECT_W": _OPTION_NOT_SELECTED,
+    "@WM_MP_FATIU21019_OPTION_TEMP_TAP_COLD_W": "Tap Cold",
+    "@WM_MP_FATIU21019_OPTION_TEMP_COLD_W": "Cold",
+    "@WM_MP_FATIU21019_OPTION_TEMP_WARM_W": "Warm",
+    "@WM_MP_FATIU21019_OPTION_TEMP_HOT_W": "Hot",
+    "@WM_MP_FATIU21019_OPTION_TEMP_EXTRA_HOT_W": "Extra Hot",
+    "@WM_MP_FATIU21019_OPTION_SPIN_NO_SPIN_W": "No Spin",
+    "@WM_MP_FATIU21019_OPTION_SPIN_LOW_W": "Low",
+    "@WM_MP_FATIU21019_OPTION_SPIN_MEDIUM_W": "Medium",
+    "@WM_MP_FATIU21019_OPTION_SPIN_HIGH_W": "High",
+    "@WM_MP_FATIU21019_OPTION_SPIN_EXTRA_HIGH_W": "Extra High",
+    "@WM_MP_FATIU21019_OPTION_SOIL_LIGHT_W": "Light",
+    "@WM_MP_FATIU21019_OPTION_SOIL_LIGHT_NORMAL_W": "Light/Normal",
+    "@WM_MP_FATIU21019_OPTION_SOIL_NORMAL_W": "Normal",
+    "@WM_MP_FATIU21019_OPTION_SOIL_NORMAL_HEAVY_W": "Normal/Heavy",
+    "@WM_MP_FATIU21019_OPTION_SOIL_HEAVY_W": "Heavy",
+    "@WM_DRY27_DRY_LEVEL_DAMP_W": "Damp",
+    "@WM_DRY27_DRY_LEVEL_LESS_W": "Less",
+    "@WM_DRY27_DRY_LEVEL_NORMAL_W": "Normal",
+    "@WM_DRY27_DRY_LEVEL_MORE_W": "More",
+    "@WM_DRY27_DRY_LEVEL_VERY_W": "Very",
+    "@WM_DRY27_TEMP_ULTRA_LOW_W": "Low",
+    "@WM_DRY27_TEMP_LOW_W": "Med. Low",
+    "@WM_DRY27_TEMP_MEDIUM_W": "Medium",
+    "@WM_DRY27_TEMP_MID_HIGH_W": "Med. High",
+    "@WM_DRY27_TEMP_HIGH_W": "High",
+}
 
 
 class WMDevice(Device):
@@ -142,6 +172,8 @@ class WMDevice(Device):
         self._smartcourse_infos: dict[str, str] | None = None
         self._selected_course: str | None = None
         self._downloaded_course_override: str | None = None
+        self._option_overrides: dict[str, str] = {}
+        self._option_maps: dict[str, dict[str, str]] = {}
         self._is_cycle_finishing = False
         self._stand_by = False
         self._remote_start_status: dict | None = None
@@ -269,6 +301,358 @@ class WMDevice(Device):
             if cid == smart_id:
                 return name
         return None
+
+    @property
+    def is_dryer(self) -> bool:
+        """Return True if this WMDevice is a dryer."""
+        return self.device_info.type in [DeviceType.DRYER, DeviceType.TOWER_DRYER]
+
+    def _iter_all_course_defs(self) -> list[tuple[str, dict, CourseType]]:
+        """Return all Course and SmartCourse definitions from model_info."""
+        if not self.model_info:
+            return []
+        entries: list[tuple[str, dict, CourseType]] = []
+        for ct in (CourseType.COURSE, CourseType.SMARTCOURSE):
+            ckey = self.get_course_key(ct)
+            if not ckey:
+                continue
+            ref_vals = self.model_info.reference_values(ckey) or {}
+            for cid, cinfo in ref_vals.items():
+                if isinstance(cinfo, dict):
+                    entries.append((cid, cinfo, ct))
+        return entries
+
+    def has_option_control(
+        self, option_key: str, *, dryer_only: bool | None = None
+    ) -> bool:
+        """Return True if model defines a pre-start selectable control for option_key."""
+        if dryer_only is not None and self.is_dryer != dryer_only:
+            return False
+        if not self.model_info or not self.model_info.is_info_v2:
+            return False
+        key = self.getkey(option_key)
+        if not self.model_info.value_exist(key) or not self.model_info.is_enum_type(key):
+            return False
+        for _, cinfo, _ in self._iter_all_course_defs():
+            for fn in cinfo.get("function", []):
+                if fn.get("value") in (option_key, key) and fn.get("selectable"):
+                    return True
+        return False
+
+    def _format_option_label(
+        self, option_key: str, raw_key: str, raw_label: str
+    ) -> str:
+        """Format an LG enum option label into a clean display string."""
+        if (
+            raw_label == "@WM_TERM_NO_SELECT_W"
+            or raw_key.startswith("NO_")
+            or (option_key == "timeDry" and raw_key.endswith("_OFF"))
+        ):
+            return _OPTION_NOT_SELECTED
+        text = self.get_enum_text(raw_label)
+        if not text or str(text) == raw_label or str(text).startswith("@"):
+            text = _OPTION_LABEL_FALLBACKS.get(str(raw_label), str(text or raw_key))
+        text_str = str(text)
+        if text_str.startswith("@"):
+            stem = text_str.lstrip("@")
+            if stem.endswith("_W"):
+                stem = stem[:-2]
+            for marker in ("_OPTION_TEMP_", "_OPTION_SPIN_", "_OPTION_SOIL_", "_DRY_LEVEL_", "_TEMP_"):
+                if marker in stem:
+                    stem = stem.split(marker, 1)[1]
+                    break
+            text_str = stem.replace("_", " ").title()
+        if option_key == "timeDry" and text_str.isdigit():
+            return f"{text_str} min"
+        return text_str
+
+    def get_option_map(self, option_key: str) -> dict[str, str]:
+        """Return ordered {display_label: raw_enum_key} for a selectable option."""
+        if option_key in self._option_maps:
+            return self._option_maps[option_key]
+        if not self.model_info or not self.model_info.is_info_v2:
+            return {}
+        key = self.getkey(option_key)
+        if not self.model_info.value_exist(key) or not self.model_info.is_enum_type(key):
+            return {}
+
+        used_raw: set[str] = set()
+        selectable_raw: set[str] = set()
+        for _, cinfo, _ in self._iter_all_course_defs():
+            for fn in cinfo.get("function", []):
+                if fn.get("value") not in (option_key, key):
+                    continue
+                if fn.get("default") is not None:
+                    used_raw.add(str(fn["default"]))
+                for sel in fn.get("selectable") or []:
+                    s_str = str(sel)
+                    used_raw.add(s_str)
+                    selectable_raw.add(s_str)
+
+        val_options = self.model_info.value(key).options
+        result: dict[str, str] = {}
+        for raw_k, raw_lbl in val_options.items():
+            is_no_select = (
+                raw_lbl == "@WM_TERM_NO_SELECT_W"
+                or raw_k.startswith("NO_")
+                or (option_key == "timeDry" and raw_k.endswith("_OFF"))
+            )
+            if not is_no_select and raw_k not in used_raw:
+                continue
+            label = self._format_option_label(option_key, raw_k, raw_lbl)
+            if label in result:
+                prev_raw = result[label]
+                if prev_raw not in selectable_raw and raw_k in selectable_raw:
+                    result[label] = raw_k
+                continue
+            result[label] = raw_k
+
+        self._option_maps[option_key] = result
+        return result
+
+    def get_option_list(self, option_key: str) -> list[str]:
+        """Return ordered option display labels for HA select entity."""
+        return list(self.get_option_map(option_key).keys())
+
+    def _resolve_target_course_info(
+        self, *, fallback_default: bool = False
+    ) -> tuple[str | None, str | None, dict | None]:
+        """Return (display_name, course_id, course_info) for staged or active course."""
+        if not self.model_info:
+            return (None, None, None)
+        n_course_key = self.get_course_key(CourseType.COURSE)
+        s_course_key = self.get_course_key(CourseType.SMARTCOURSE)
+        dl_ap_id = self.model_info.config_value("downloadCourseAPId") or "DOWNLOAD"
+        course_infos = self._get_course_infos()
+
+        if self._selected_course and self._selected_course in course_infos:
+            cid = course_infos[self._selected_course]
+            if cid in (dl_ap_id, _DOWNLOAD_SLOT_SENTINEL) and s_course_key:
+                smart_id = self._current_downloaded_course_id()
+                sc_info = (
+                    self._get_course_details(s_course_key, smart_id)
+                    if smart_id
+                    else None
+                )
+                if sc_info:
+                    return (self.downloaded_course or self._selected_course, smart_id, sc_info)
+            cinfo = self._get_course_details(n_course_key, cid) if n_course_key else None
+            return (self._selected_course, cid, cinfo)
+
+        data = self._status.as_dict if self._status else None
+        if data:
+            for ckey in (n_course_key, s_course_key):
+                if not ckey:
+                    continue
+                raw_id = str(data.get(ckey))
+                if ckey == n_course_key and raw_id == dl_ap_id and s_course_key:
+                    smart_id = self._current_downloaded_course_id()
+                    if smart_id and (
+                        sc_info := self._get_course_details(s_course_key, smart_id)
+                    ):
+                        return (self.downloaded_course or self._download_panel_label, smart_id, sc_info)
+                if cinfo := self._get_course_details(ckey, raw_id):
+                    disp = next(
+                        (nm for nm, val in course_infos.items() if val == raw_id),
+                        raw_id,
+                    )
+                    return (disp, raw_id, cinfo)
+
+        if fallback_default and n_course_key:
+            def_cid = self.model_info.config_value(
+                f"default{self._getcmdkey('Course')}"
+            )
+            if def_cid and (cinfo := self._get_course_details(n_course_key, def_cid)):
+                disp = next(
+                    (nm for nm, val in course_infos.items() if val == def_cid),
+                    str(def_cid),
+                )
+                return (disp, str(def_cid), cinfo)
+
+        return (None, None, None)
+
+    @staticmethod
+    def _course_func_entry(course_info: dict | None, option_key: str) -> dict | None:
+        """Return matching function dict for option_key inside course_info."""
+        if not course_info:
+            return None
+        for fn in course_info.get("function", []):
+            if fn.get("value") == option_key:
+                return fn
+        return None
+
+    def get_option_value(self, option_key: str) -> str | None:
+        """Return staged, selected-course default, or live display option."""
+        _ = self.select_course_enabled
+        opt_map = self.get_option_map(option_key)
+        if not opt_map:
+            return None
+        rev_map = {raw_k: lbl for lbl, raw_k in opt_map.items()}
+
+        if (override := self._option_overrides.get(option_key)) and override in rev_map:
+            return rev_map[override]
+
+        if self._selected_course:
+            _, _, cinfo = self._resolve_target_course_info()
+            fn = self._course_func_entry(cinfo, option_key)
+            if fn and (def_val := fn.get("default")) is not None:
+                if str(def_val) in rev_map:
+                    return rev_map[str(def_val)]
+            if _OPTION_NOT_SELECTED in opt_map:
+                return _OPTION_NOT_SELECTED
+
+        if self._status and self._status.as_dict:
+            raw_live = self._status.as_dict.get(self.getkey(option_key))
+            if raw_live is not None and str(raw_live) in rev_map:
+                return rev_map[str(raw_live)]
+
+        if _OPTION_NOT_SELECTED in opt_map:
+            return _OPTION_NOT_SELECTED
+        return None
+
+    def get_switch_option_value(self, option_key: str) -> bool:
+        """Return staged, selected-course default, or live boolean state for an enum switch option."""
+        _ = self.select_course_enabled
+        if override := self._option_overrides.get(option_key):
+            return str(override).endswith("_ON")
+
+        if self._selected_course:
+            _, _, cinfo = self._resolve_target_course_info()
+            fn = self._course_func_entry(cinfo, option_key)
+            if fn and fn.get("default") is not None:
+                return str(fn["default"]).endswith("_ON")
+            return False
+
+        if self._status and self._status.as_dict:
+            raw_live = self._status.as_dict.get(self.getkey(option_key))
+            if raw_live is not None:
+                return str(raw_live).endswith("_ON")
+        return False
+
+    def _allowed_courses_for_option(self, option_key: str) -> list[str]:
+        """Return standard course display names that allow changing option_key."""
+        n_course_key = self.get_course_key(CourseType.COURSE)
+        if not n_course_key:
+            return []
+        allowed: list[str] = []
+        for disp, cid in self._get_course_infos().items():
+            cinfo = self._get_course_details(n_course_key, cid)
+            fn = self._course_func_entry(cinfo, option_key)
+            if fn and fn.get("selectable"):
+                allowed.append(disp)
+        return allowed
+
+    async def set_course_option(
+        self, option_key: str, display_value: str, friendly_label: str = "Option"
+    ) -> None:
+        """Stage a pre-start course option to be sent on the next Remote Start."""
+        if not self.select_course_enabled:
+            raise InvalidDeviceStatus(
+                f"{friendly_label} can only be changed before starting when Remote Start is on at the machine"
+            )
+        opt_map = self.get_option_map(option_key)
+        if display_value not in opt_map:
+            raise ValueError(f"Invalid {friendly_label}: {display_value}")
+
+        if display_value == _OPTION_NOT_SELECTED:
+            self._option_overrides.pop(option_key, None)
+            return
+
+        raw_val = opt_map[display_value]
+
+        if option_key == "timeDry":
+            _, _, cur_info = self._resolve_target_course_info(fallback_default=True)
+            cur_fn = self._course_func_entry(cur_info, "timeDry")
+            if not (cur_fn and cur_fn.get("selectable")):
+                td_courses = self._allowed_courses_for_option("timeDry")
+                if td_courses:
+                    self._selected_course = td_courses[0]
+                    self._option_overrides.pop("dryLevel", None)
+
+        course_name, _, cinfo = self._resolve_target_course_info(fallback_default=True)
+        if cinfo:
+            fn = self._course_func_entry(cinfo, option_key)
+            selectable = [str(x) for x in (fn.get("selectable") or [])] if fn else []
+            if not selectable:
+                allowed_courses = self._allowed_courses_for_option(option_key)
+                hint = (
+                    f"; adjustable on {', '.join(allowed_courses)}"
+                    if allowed_courses
+                    else ""
+                )
+                raise InvalidDeviceStatus(
+                    f"{course_name or 'Selected cycle'} does not allow changing {friendly_label}{hint}"
+                )
+            if raw_val not in selectable:
+                rev_map = {rk: lbl for lbl, rk in opt_map.items()}
+                allowed_labels = [rev_map[rk] for rk in selectable if rk in rev_map]
+                raise InvalidDeviceStatus(
+                    f"{course_name or 'Selected cycle'} allows {friendly_label}: {', '.join(allowed_labels)}"
+                )
+
+        self._option_overrides[option_key] = raw_val
+
+    async def set_switch_option(
+        self, option_key: str, turn_on: bool, friendly_label: str = "Option"
+    ) -> None:
+        """Stage a pre-start boolean enum option (freshCare / wrinkleCare)."""
+        if not self.select_course_enabled:
+            raise InvalidDeviceStatus(
+                f"{friendly_label} can only be changed before starting when Remote Start is on at the machine"
+            )
+        key = self.getkey(option_key)
+        val_options = self.model_info.value(key).options
+        suffix = "_ON" if turn_on else "_OFF"
+        raw_val = next((rk for rk in val_options if rk.endswith(suffix)), None)
+        if not raw_val:
+            raise ValueError(f"Unsupported {friendly_label} state: {turn_on}")
+
+        course_name, _, cinfo = self._resolve_target_course_info(fallback_default=True)
+        if cinfo:
+            fn = self._course_func_entry(cinfo, option_key)
+            selectable = [str(x) for x in (fn.get("selectable") or [])] if fn else []
+            if not selectable or raw_val not in selectable:
+                raise InvalidDeviceStatus(
+                    f"{course_name or 'Selected cycle'} does not support changing {friendly_label}"
+                )
+
+        self._option_overrides[option_key] = raw_val
+
+    def _apply_staged_options_to_dict(self, course_info: dict, ret_data: dict) -> None:
+        """Apply valid staged pre-start option overrides onto a ThinQ2 payload dict."""
+        if not self._option_overrides or not course_info:
+            return
+        for func_key in course_info.get("function", []):
+            ckey = func_key.get("value")
+            selectable = [str(x) for x in (func_key.get("selectable") or [])]
+            if ckey and ckey in self._option_overrides and self._option_overrides[ckey] in selectable:
+                chosen = self._option_overrides[ckey]
+                ret_data[ckey] = chosen
+                if ckey == "timeDry" and "moreLessTime" in ret_data:
+                    tail = chosen.rsplit("_", 1)[-1]
+                    if tail.isdigit():
+                        ret_data["moreLessTime"] = int(tail)
+
+    def _collect_vtctrl_staged_options(
+        self, course_info: dict | None
+    ) -> list[dict[str, str]]:
+        """Build vtCtrl ABSOLUTE command items for valid staged pre-start overrides."""
+        if not self._option_overrides or not course_info:
+            return []
+        items: list[dict[str, str]] = []
+        for func_key in course_info.get("function", []):
+            ckey = func_key.get("value")
+            selectable = [str(x) for x in (func_key.get("selectable") or [])]
+            if ckey and ckey in self._option_overrides and self._option_overrides[ckey] in selectable:
+                out_key = "reserveTimeMinute" if ckey == "reserveTimeHour" else ckey
+                items.append(
+                    {
+                        "cmd": out_key,
+                        "type": "ABSOLUTE",
+                        "value": str(self._option_overrides[ckey]),
+                    }
+                )
+        return items
 
     @property
     def run_state(self) -> str:
@@ -570,6 +954,8 @@ class WMDevice(Device):
                 continue
             ret_data[ckey] = cdata
 
+        self._apply_staged_options_to_dict(course_info, ret_data)
+
         if not course_set:
             ret_data[VT_CTRL_COURSE_INFO] = course_info
 
@@ -824,6 +1210,11 @@ class WMDevice(Device):
                     vt_cmd_data.append(
                         {"cmd": "course", "type": "ABSOLUTE", "value": str(c_id)}
                     )
+            if self._initial_bit_start and self._option_overrides:
+                _, _, target_cinfo = self._resolve_target_course_info(
+                    fallback_default=True
+                )
+                vt_cmd_data.extend(self._collect_vtctrl_staged_options(target_cinfo))
             vt_cmd_data.append(
                 {"cmd": "wmControl", "type": "ABSOLUTE", "value": ctrl_val}
             )
@@ -923,8 +1314,11 @@ class WMDevice(Device):
     def select_course_enabled(self) -> bool:
         """Return if selecr course is enabled."""
         enabled = self._initial_bit_start and self.remote_start_enabled
-        if not enabled and self._selected_course:
-            self._selected_course = None
+        if not enabled:
+            if self._selected_course:
+                self._selected_course = None
+            if self._option_overrides:
+                self._option_overrides.clear()
         return enabled
 
     @property
@@ -1003,6 +1397,9 @@ class WMDevice(Device):
             for func_key in course_info.get("function", []):
                 ckey = func_key.get("value")
                 defdata = func_key.get("default")
+                selectable = [str(x) for x in (func_key.get("selectable") or [])]
+                if ckey in self._option_overrides and self._option_overrides[ckey] in selectable:
+                    defdata = self._option_overrides[ckey]
                 if not ckey or defdata is None:
                     continue
                 out_key = "reserveTimeMinute" if ckey == "reserveTimeHour" else ckey
@@ -1062,6 +1459,9 @@ class WMDevice(Device):
         for func_key in course_info.get("function", []):
             ckey = func_key.get("value")
             defdata = func_key.get("default")
+            selectable = [str(x) for x in (func_key.get("selectable") or [])]
+            if ckey in self._option_overrides and self._option_overrides[ckey] in selectable:
+                defdata = self._option_overrides[ckey]
             if ckey and defdata is not None:
                 payload[ckey] = defdata
 
@@ -1120,6 +1520,18 @@ class WMDevice(Device):
 
         if self.select_course_enabled and self._download_panel_label in self.course_list:
             self._selected_course = self._download_panel_label
+            self._prune_overrides_for_course(course_info)
+
+    def _prune_overrides_for_course(self, course_info: dict | None) -> None:
+        """Reset cycle-specific option overrides on course change; keep switch overrides if still selectable."""
+        for k in list(self._option_overrides.keys()):
+            if k not in _OPTION_SWITCH_KEYS:
+                self._option_overrides.pop(k, None)
+                continue
+            fn = self._course_func_entry(course_info, k)
+            selectable = [str(x) for x in (fn.get("selectable") or [])] if fn else []
+            if self._option_overrides[k] not in selectable:
+                self._option_overrides.pop(k, None)
 
     async def select_start_course(self, course_name: str) -> None:
         """Select a secific course for remote start."""
@@ -1128,10 +1540,14 @@ class WMDevice(Device):
 
         if course_name == _CURRENT_COURSE:
             self._selected_course = None
+            self._option_overrides.clear()
             return
         if course_name not in self.course_list:
             raise ValueError(f"Invalid course: {course_name}")
-        self._selected_course = course_name
+        if self._selected_course != course_name:
+            self._selected_course = course_name
+            _, _, cinfo = self._resolve_target_course_info()
+            self._prune_overrides_for_course(cinfo)
 
     async def power_off(self):
         """Power off the device."""
@@ -1167,6 +1583,7 @@ class WMDevice(Device):
         keys = self._get_cmd_keys(CMD_REMOTE_START)
         await self.set(keys[0], keys[1], key=keys[2])
         self._remote_start_pressed = True
+        self._option_overrides.clear()
 
     async def pause(self):
         """Pause the device."""

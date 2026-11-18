@@ -62,6 +62,78 @@ WASH_DEV_SELECT: tuple[ThinQSelectEntityDescription, ...] = (
         value_fn=lambda x: x.device.downloaded_course,
         exist_fn=lambda x: x.device.has_downloaded_courses,
     ),
+    ThinQSelectEntityDescription(
+        key="water_temp",
+        name="Water temp",
+        icon="mdi:thermometer-water",
+        options_fn=lambda x: x.device.get_option_list("temp"),
+        select_option_fn=lambda x, option: x.device.set_course_option(
+            "temp", option, "Water temp"
+        ),
+        available_fn=lambda x: x.device.course_display_enabled,
+        value_fn=lambda x: x.device.get_option_value("temp"),
+        exist_fn=lambda x: x.device.has_option_control("temp", dryer_only=False),
+    ),
+    ThinQSelectEntityDescription(
+        key="spin_speed",
+        name="Spin speed",
+        icon="mdi:rotate-right",
+        options_fn=lambda x: x.device.get_option_list("spin"),
+        select_option_fn=lambda x, option: x.device.set_course_option(
+            "spin", option, "Spin speed"
+        ),
+        available_fn=lambda x: x.device.course_display_enabled,
+        value_fn=lambda x: x.device.get_option_value("spin"),
+        exist_fn=lambda x: x.device.has_option_control("spin", dryer_only=False),
+    ),
+    ThinQSelectEntityDescription(
+        key="soil_level",
+        name="Soil level",
+        icon="mdi:water-opacity",
+        options_fn=lambda x: x.device.get_option_list("soilWash"),
+        select_option_fn=lambda x, option: x.device.set_course_option(
+            "soilWash", option, "Soil level"
+        ),
+        available_fn=lambda x: x.device.course_display_enabled,
+        value_fn=lambda x: x.device.get_option_value("soilWash"),
+        exist_fn=lambda x: x.device.has_option_control("soilWash", dryer_only=False),
+    ),
+    ThinQSelectEntityDescription(
+        key="dry_level",
+        name="Dry level",
+        icon="mdi:water-percent",
+        options_fn=lambda x: x.device.get_option_list("dryLevel"),
+        select_option_fn=lambda x, option: x.device.set_course_option(
+            "dryLevel", option, "Dry level"
+        ),
+        available_fn=lambda x: x.device.course_display_enabled,
+        value_fn=lambda x: x.device.get_option_value("dryLevel"),
+        exist_fn=lambda x: x.device.has_option_control("dryLevel", dryer_only=True),
+    ),
+    ThinQSelectEntityDescription(
+        key="temp_control",
+        name="Temp control",
+        icon="mdi:thermometer",
+        options_fn=lambda x: x.device.get_option_list("temp"),
+        select_option_fn=lambda x, option: x.device.set_course_option(
+            "temp", option, "Temp control"
+        ),
+        available_fn=lambda x: x.device.course_display_enabled,
+        value_fn=lambda x: x.device.get_option_value("temp"),
+        exist_fn=lambda x: x.device.has_option_control("temp", dryer_only=True),
+    ),
+    ThinQSelectEntityDescription(
+        key="time_dry",
+        name="Time dry",
+        icon="mdi:timer-outline",
+        options_fn=lambda x: x.device.get_option_list("timeDry"),
+        select_option_fn=lambda x, option: x.device.set_course_option(
+            "timeDry", option, "Time dry"
+        ),
+        available_fn=lambda x: x.device.course_display_enabled,
+        value_fn=lambda x: x.device.get_option_value("timeDry"),
+        exist_fn=lambda x: x.device.has_option_control("timeDry", dryer_only=True),
+    ),
 )
 MICROWAVE_SELECT: tuple[ThinQSelectEntityDescription, ...] = (
     ThinQSelectEntityDescription(
@@ -162,6 +234,8 @@ class LGESelect(CoordinatorEntity, SelectEntity):
         try:
             await self.entity_description.select_option_fn(self._api, option)
         except InvalidDeviceStatus as exc:
+            if str(exc):
+                raise HomeAssistantError(str(exc)) from exc
             if self.entity_description.key == "course_selection":
                 raise HomeAssistantError(
                     "Cycle can only be changed before starting when Remote Start is on at the machine"
@@ -170,7 +244,9 @@ class LGESelect(CoordinatorEntity, SelectEntity):
                 raise HomeAssistantError(
                     "Downloaded cycle cannot be changed while a cycle is running or Child Lock is on"
                 ) from exc
-            raise HomeAssistantError(str(exc)) from exc
+            raise HomeAssistantError(
+                "Option can only be changed before starting when Remote Start is on at the machine"
+            ) from exc
         self._api.async_set_updated()
         if (
             self.entity_description.key == "downloaded_course"

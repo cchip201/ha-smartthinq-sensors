@@ -13,6 +13,7 @@ from homeassistant.components.button import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -21,6 +22,7 @@ from . import LGEDevice
 from .const import DOMAIN, LGE_DEVICES, LGE_DISCOVERY_NEW
 from .device_helpers import LGEBaseDevice
 from .wideq import WM_DEVICE_TYPES, WashDeviceFeatures
+from .wideq.core_exceptions import InvalidDeviceStatus
 
 # general button attributes
 ATTR_REMOTE_START = "remote_start"
@@ -145,5 +147,11 @@ class LGEButton(CoordinatorEntity, ButtonEntity):
 
     async def async_press(self) -> None:
         """Triggers service."""
-        await self.entity_description.press_action_fn(self._wrap_device)
+        try:
+            await self.entity_description.press_action_fn(self._wrap_device)
+        except InvalidDeviceStatus as exc:
+            raise HomeAssistantError(
+                "Device is not ready for this action (check power and Remote Start)"
+            ) from exc
         self._api.async_set_updated()
+        self._api.async_schedule_post_control_refresh()

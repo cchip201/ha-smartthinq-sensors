@@ -268,6 +268,7 @@ class LGESwitch(LGEBaseSwitch):
         if self.is_on:
             await self.entity_description.turn_off_fn(self._wrap_device)
             self._api.async_set_updated()
+            self._api.async_schedule_post_control_refresh()
 
     async def async_turn_on(self, **kwargs):
         """Turn the entity on."""
@@ -276,6 +277,7 @@ class LGESwitch(LGEBaseSwitch):
         if not self.is_on:
             await self.entity_description.turn_on_fn(self._wrap_device)
             self._api.async_set_updated()
+            self._api.async_schedule_post_control_refresh()
 
     def _get_switch_state(self):
         """Get current switch state"""

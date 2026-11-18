@@ -577,3 +577,176 @@ async def test_select_exist_respects_has_downloaded_courses():
     dev_without = SimpleNamespace(device=SimpleNamespace(has_downloaded_courses=False))
     assert _select_exist(dev_with, dl_desc) is True
     assert _select_exist(dev_without, dl_desc) is False
+
+
+async def test_dryer_pause_then_immediate_resume_and_course_display():
+    """Dryer shows active cycle while running/paused and allows Start right after Pause without reload."""
+    dryer_model = deepcopy(DRYER_MODEL_DATA)
+    dryer_model["ControlWifi"]["WMStop"] = {
+        "command": "Set",
+        "data": {
+            "washerDryer": {
+                "controlDataType": "PAUSE",
+                "controlDataValueLength": 1,
+                "controlDataValue": 0,
+            }
+        },
+    }
+    dryer_model["Course"]["TOWELS"] = {
+        "_comment": "Towels",
+        "courseType": "Course",
+        "courseValue": "TOWELS",
+        "name": "@WM_MP_FATIU21019_COURSE_TOWELS_W",
+        "function": [
+            {"value": "temp", "default": "TEMP_MEDIUM"},
+            {"value": "dryLevel", "default": "DRYLEVEL_NORMAL"},
+        ],
+    }
+
+    dev, client = await _make_wm_device(
+        dryer_model,
+        202,
+        {
+            "state": "DRYING",
+            "preState": "INITIAL",
+            "remoteStart": "REMOTE_START_ON",
+            "childLock": "CHILDLOCK_OFF",
+            "initialBit": "INITIAL_BIT_OFF",
+            "courseDryer27inchBase": "TOWELS",
+            "smartCourseDryer27inchBase": "NOT_SELECTED",
+            "downloadedCourseDryer27inchBase": "ULTRADELICATES",
+            "temp": "TEMP_MEDIUM",
+            "dryLevel": "DRYLEVEL_NORMAL",
+        },
+    )
+
+    assert dev.course_display_enabled is True
+    assert dev.selected_course == "Towels"
+    assert dev.downloaded_course_display_enabled is True
+    assert dev.downloaded_course == "Ultra Delicate"
+    assert dev.pause_enabled is True
+    assert dev.remote_start_enabled is False
+
+    # Press Pause: WMStop sent, Start becomes immediately enabled WITHOUT a poll or reload
+    await dev.pause()
+    assert len(client.sent) == 1
+    assert client.sent[0]["ctrlKey"] == "WMControl"
+    assert client.sent[0]["command"] == "Set"
+    assert client.sent[0]["dataSetList"]["washerDryer"]["controlDataType"] == "PAUSE"
+    assert dev.pause_enabled is False
+    assert dev.remote_start_enabled is True
+    assert dev.course_display_enabled is True
+    assert dev.selected_course == "Towels"
+
+    # Immediately press Start (resume) WITHOUT any poll in between
+    client.sent.clear()
+    await dev.remote_start()
+    assert len(client.sent) == 1
+    resume_wd = client.sent[0]["dataSetList"]["washerDryer"]
+    assert resume_wd["courseDryer27inchBase"] == "TOWELS"
+    assert resume_wd["smartCourseDryer27inchBase"] == "NOT_SELECTED"
+    assert resume_wd["initialBit"] == "INITIAL_BIT_OFF"
+    assert dev.remote_start_enabled is False
+
+
+async def test_dryer_running_smartcourse_display_and_poweroff_unavailable():
+    """Dryer shows Downloaded + SmartCourse name when running a downloaded cycle, and unavailable when off."""
+    dev, client = await _make_wm_device(
+        DRYER_MODEL_DATA,
+        202,
+        {
+            "state": "DRYING",
+            "preState": "INITIAL",
+            "remoteStart": "REMOTE_START_ON",
+            "childLock": "CHILDLOCK_OFF",
+            "initialBit": "INITIAL_BIT_OFF",
+            "courseDryer27inchBase": "ULTRA_DELICATES",
+            "smartCourseDryer27inchBase": "ULTRADELICATES",
+            "downloadedCourseDryer27inchBase": "ULTRADELICATES",
+        },
+    )
+    wrapper = LGEWashDevice(SimpleNamespace(state=dev.status, device=dev))
+    assert dev.course_display_enabled is True
+    assert dev.selected_course == "Downloaded"
+    assert dev.status.current_course == "Ultra Delicate"
+    assert wrapper.current_course == "Ultra Delicate"
+    assert dev.downloaded_course_display_enabled is True
+    assert dev.downloaded_course == "Ultra Delicate"
+
+    # Idle INITIAL with NOT_SELECTED does not misread stored downloaded slot as active course
+    client._snapshot["washerDryer"].update(
+        {
+            "state": "INITIAL",
+            "courseDryer27inchBase": "NOT_SELECTED",
+            "smartCourseDryer27inchBase": "NOT_SELECTED",
+        }
+    )
+    await dev.poll()
+    wrapper_idle = LGEWashDevice(SimpleNamespace(state=dev.status, device=dev))
+    assert dev.course_display_enabled is True
+    assert dev.selected_course == "Current course"
+    assert dev.status.current_course == "-"
+    assert wrapper_idle.current_course == "-"
+
+    # Powered off: course_display_enabled False, downloaded_course_display_enabled True
+    client._snapshot["washerDryer"]["state"] = "POWEROFF"
+    await dev.poll()
+    assert dev.course_display_enabled is False
+    assert dev.downloaded_course_display_enabled is True
+
+
+async def test_select_raises_homeassistant_error_and_debounced_refresh(hass):
+    """Selecting a course while running raises HomeAssistantError; post-control refresh coalesces."""
+    from unittest.mock import AsyncMock
+    from homeassistant.exceptions import HomeAssistantError
+    from custom_components.smartthinq_sensors import DOMAIN, LGEDevice
+    from custom_components.smartthinq_sensors.select import LGESelect, WASH_DEV_SELECT
+
+    dev, _ = await _make_wm_device(
+        DRYER_MODEL_DATA,
+        202,
+        {
+            "state": "DRYING",
+            "preState": "INITIAL",
+            "remoteStart": "REMOTE_START_ON",
+            "childLock": "CHILDLOCK_OFF",
+            "initialBit": "INITIAL_BIT_OFF",
+            "courseDryer27inchBase": "NORMAL",
+            "smartCourseDryer27inchBase": "NOT_SELECTED",
+            "downloadedCourseDryer27inchBase": "ULTRADELICATES",
+        },
+    )
+    lge_api = LGEDevice(dev, hass)
+    lge_api._state = dev.status
+    lge_api._coordinator = SimpleNamespace(
+        async_set_updated_data=lambda _d: None,
+        async_request_refresh=AsyncMock(),
+        async_add_listener=lambda *_a, **_k: (lambda: None),
+    )
+    hass.data.setdefault(DOMAIN, {})
+
+    course_desc = next(d for d in WASH_DEV_SELECT if d.key == "course_selection")
+    dl_desc = next(d for d in WASH_DEV_SELECT if d.key == "downloaded_course")
+    sel_course = LGESelect(lge_api, course_desc)
+    sel_dl = LGESelect(lge_api, dl_desc)
+
+    assert sel_course.available is True
+    assert sel_course.current_option == "Normal"
+    assert sel_dl.available is True
+    assert sel_dl.current_option == "Ultra Delicate"
+
+    with pytest.raises(HomeAssistantError, match="Remote Start"):
+        await sel_course.async_select_option("Downloaded")
+
+    with pytest.raises(HomeAssistantError, match="Downloaded cycle"):
+        await sel_dl.async_select_option("Denim")
+
+    # Debounced post-control refresh coalesces multiple calls and cancels cleanly
+    lge_api.async_schedule_post_control_refresh(delay=0.01)
+    lge_api.async_schedule_post_control_refresh(delay=0.01)
+    await hass.async_block_till_done()
+    import asyncio
+    await asyncio.sleep(0.03)
+    await hass.async_block_till_done()
+    assert lge_api._coordinator.async_request_refresh.await_count == 1
+    lge_api.cancel_post_control_refresh()

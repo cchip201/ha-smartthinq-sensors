@@ -192,8 +192,39 @@ class WMDevice(Device):
 
     @property
     def selected_course(self) -> str:
-        """Return current selected course."""
-        return self._selected_course or _CURRENT_COURSE
+        """Return staged course selection, or the active course on the machine when on."""
+        if self._selected_course and self._selected_course in self.course_list:
+            return self._selected_course
+        if self._status and self._status.is_on:
+            course_infos = self._get_course_infos()
+            n_key = self.get_course_key(CourseType.COURSE)
+            raw_course = (
+                str(self._status.as_dict.get(n_key))
+                if (n_key and self._status.as_dict)
+                else None
+            )
+            dl_ap_id = (
+                self.model_info.config_value("downloadCourseAPId")
+                if self.model_info
+                else None
+            ) or "DOWNLOAD"
+            if raw_course:
+                for name, cid in course_infos.items():
+                    if cid == raw_course:
+                        return name
+                if (
+                    raw_course == dl_ap_id
+                    and self._download_panel_label in self.course_list
+                ):
+                    return self._download_panel_label
+            smart_active = self._status.current_smartcourse
+            if (
+                smart_active
+                and smart_active != StateOptions.NONE
+                and self._download_panel_label in self.course_list
+            ):
+                return self._download_panel_label
+        return _CURRENT_COURSE
 
     @property
     def has_downloaded_courses(self) -> bool:
@@ -897,6 +928,22 @@ class WMDevice(Device):
         return enabled
 
     @property
+    def course_display_enabled(self) -> bool:
+        """Return True when the appliance is on so active/selected course is visible."""
+        if not self._status:
+            return False
+        return bool(self._status.is_on and not self.stand_by)
+
+    @property
+    def downloaded_course_display_enabled(self) -> bool:
+        """Return True when downloaded course slot can be read or written."""
+        if not (self.has_downloaded_courses and self._status and self.model_info):
+            return False
+        if self.download_course_enabled:
+            return True
+        return bool(self._status.is_on and not self.stand_by)
+
+    @property
     def download_course_enabled(self) -> bool:
         """Return True if downloading a SmartCourse into the device slot is allowed."""
         if not (self.has_downloaded_courses and self._status and self.model_info):
@@ -1128,9 +1175,7 @@ class WMDevice(Device):
 
         keys = self._get_cmd_keys(CMD_PAUSE)
         await self.set(keys[0], keys[1])
-        # this is to keep remote start disabled until next refresh
-        self._remote_start_pressed = True
-        # this is to keep remote start disabled until next refresh
+        self._remote_start_pressed = False
         self._update_status(POWER_STATUS_KEY, self._state_pause)
 
     async def set(
@@ -1385,17 +1430,41 @@ class WMStatus(DeviceStatus):
             if smart and smart != StateOptions.NONE:
                 return smart
         course = self.lookup_reference(course_key, ref_key="name")
-        return self._device.get_enum_text(course)
+        text = self._device.get_enum_text(course)
+        if text and text != StateOptions.NONE:
+            return text
+        smart = self.current_smartcourse
+        if smart and smart != StateOptions.NONE:
+            return smart
+        return StateOptions.NONE
 
     @property
     def current_smartcourse(self):
-        """Return current smartcourse."""
-        for ct in (CourseType.SMARTCOURSE, CourseType.DOWNLOADEDCOURSE):
-            if course_key := self._device.get_course_key(ct):
-                smart_course = self.lookup_reference(course_key, ref_key="name")
-                text = self._device.get_enum_text(smart_course)
-                if text and text != StateOptions.NONE:
-                    return text
+        """Return current active smartcourse."""
+        s_key = self._device.get_course_key(CourseType.SMARTCOURSE)
+        dl_key = self._device.get_course_key(CourseType.DOWNLOADEDCOURSE)
+        c_key = self._device.get_course_key(CourseType.COURSE)
+        dl_ap_id = (
+            self._device.model_info.config_value("downloadCourseAPId")
+            if self._device.model_info
+            else None
+        ) or "DOWNLOAD"
+        curr_c_key = self._get_data_key(c_key) if c_key else None
+        is_dl_slot_selected = bool(
+            curr_c_key and self._data.get(curr_c_key) == dl_ap_id
+        )
+        if s_key and s_key != dl_key:
+            smart_course = self.lookup_reference(s_key, ref_key="name")
+            text = self._device.get_enum_text(smart_course)
+            if text and text != StateOptions.NONE:
+                return text
+        if is_dl_slot_selected:
+            for key in (s_key, dl_key):
+                if key:
+                    smart_course = self.lookup_reference(key, ref_key="name")
+                    text = self._device.get_enum_text(smart_course)
+                    if text and text != StateOptions.NONE:
+                        return text
         return StateOptions.NONE
 
     def _get_time_info(self, keys: list[str]):

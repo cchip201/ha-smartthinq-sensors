@@ -9,6 +9,7 @@ from typing import Any, Awaitable, Callable
 from homeassistant.components.select import SelectEntity, SelectEntityDescription
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -17,6 +18,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from . import LGEDevice
 from .const import DOMAIN, LGE_DEVICES, LGE_DISCOVERY_NEW
 from .wideq import WM_DEVICE_TYPES, DeviceType, MicroWaveFeatures
+from .wideq.core_exceptions import InvalidDeviceStatus
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -47,7 +49,7 @@ WASH_DEV_SELECT: tuple[ThinQSelectEntityDescription, ...] = (
         icon="mdi:tune-vertical-variant",
         options_fn=lambda x: x.device.course_list,
         select_option_fn=lambda x, option: x.device.select_start_course(option),
-        available_fn=lambda x: x.device.select_course_enabled,
+        available_fn=lambda x: x.device.course_display_enabled,
         value_fn=lambda x: x.device.selected_course,
     ),
     ThinQSelectEntityDescription(
@@ -56,7 +58,7 @@ WASH_DEV_SELECT: tuple[ThinQSelectEntityDescription, ...] = (
         icon="mdi:cloud-download-outline",
         options_fn=lambda x: x.device.downloaded_course_list,
         select_option_fn=lambda x, option: x.device.select_downloaded_course(option),
-        available_fn=lambda x: x.device.download_course_enabled,
+        available_fn=lambda x: x.device.downloaded_course_display_enabled,
         value_fn=lambda x: x.device.downloaded_course,
         exist_fn=lambda x: x.device.has_downloaded_courses,
     ),
@@ -157,8 +159,25 @@ class LGESelect(CoordinatorEntity, SelectEntity):
 
     async def async_select_option(self, option: str) -> None:
         """Change the selected option."""
-        await self.entity_description.select_option_fn(self._api, option)
+        try:
+            await self.entity_description.select_option_fn(self._api, option)
+        except InvalidDeviceStatus as exc:
+            if self.entity_description.key == "course_selection":
+                raise HomeAssistantError(
+                    "Cycle can only be changed before starting when Remote Start is on at the machine"
+                ) from exc
+            if self.entity_description.key == "downloaded_course":
+                raise HomeAssistantError(
+                    "Downloaded cycle cannot be changed while a cycle is running or Child Lock is on"
+                ) from exc
+            raise HomeAssistantError(str(exc)) from exc
         self._api.async_set_updated()
+        if (
+            self.entity_description.key == "downloaded_course"
+            and self._api.state
+            and getattr(self._api.state, "is_on", False)
+        ):
+            self._api.async_schedule_post_control_refresh()
 
     @property
     def current_option(self) -> str | None:

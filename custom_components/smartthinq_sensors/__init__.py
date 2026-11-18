@@ -28,7 +28,7 @@ from homeassistant.helpers.dispatcher import (
     async_dispatcher_send,
 )
 from homeassistant.helpers.entity import DeviceInfo
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.event import async_call_later, async_track_time_interval
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import (
@@ -380,6 +380,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     lg_loaded = CLIENT in hass.data.get(DOMAIN, {})
     platforms = SMARTTHINQ_PLATFORMS if lg_loaded else [Platform.NUMBER]
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, platforms):
+        for dev_list in hass.data.get(DOMAIN, {}).get(LGE_DEVICES, {}).values():
+            for lge_dev in dev_list:
+                lge_dev.cancel_post_control_refresh()
         data = hass.data.pop(DOMAIN)
         reload = data.get(SIGNAL_RELOAD_ENTRY, 0)
         if reload > 0:
@@ -415,6 +418,7 @@ class LGEDevice:
         self._coordinator: DataUpdateCoordinator | None = None
         self._disc_count = 0
         self._available = True
+        self._cancel_post_control_refresh: Callable[[], None] | None = None
 
     @property
     def available(self) -> bool:
@@ -504,6 +508,29 @@ class LGEDevice:
         """Manually update state and notify coordinator entities."""
         if self._coordinator:
             self._coordinator.async_set_updated_data(self._state)
+
+    @callback
+    def cancel_post_control_refresh(self) -> None:
+        """Cancel any pending post-control coordinator refresh timer."""
+        if self._cancel_post_control_refresh is not None:
+            self._cancel_post_control_refresh()
+            self._cancel_post_control_refresh = None
+
+    @callback
+    def async_schedule_post_control_refresh(self, delay: float = 5.0) -> None:
+        """Schedule one debounced coordinator refresh shortly after a control action."""
+        self.cancel_post_control_refresh()
+        if not self._coordinator:
+            return
+
+        async def _refresh(_now) -> None:
+            self._cancel_post_control_refresh = None
+            if self._coordinator and DOMAIN in self._hass.data:
+                await self._coordinator.async_request_refresh()
+
+        self._cancel_post_control_refresh = async_call_later(
+            self._hass, delay, _refresh
+        )
 
     async def _create_coordinator(self) -> None:
         """Get the coordinator for a specific device."""

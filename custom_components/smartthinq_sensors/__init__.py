@@ -527,6 +527,8 @@ class LGEDevice:
             self._cancel_post_control_refresh = None
             if self._coordinator and DOMAIN in self._hass.data:
                 await self._coordinator.async_request_refresh()
+                if getattr(self._device, "is_starting", False):
+                    self.async_schedule_post_control_refresh(delay=3.0)
 
         self._cancel_post_control_refresh = async_call_later(
             self._hass, delay, _refresh

@@ -15,5 +15,5 @@
     "xmltodict>=0.13.0",
     "charset_normalizer>=3.2.0"
   ],
-  "version": "0.43.0-cmcore.4"
+  "version": "0.43.0-cmcore.5"
 }

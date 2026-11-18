@@ -734,6 +734,8 @@ class LGESensor(CoordinatorEntity, SensorEntity):
         if self._api.type not in WM_DEVICE_TYPES:
             raise NotImplementedError()
         await self._api.device.remote_start(course)
+        self._api.async_set_updated()
+        self._api.async_schedule_post_control_refresh()
 
     async def async_wake_up(self):
         """Call the wakeup command for WM devices."""

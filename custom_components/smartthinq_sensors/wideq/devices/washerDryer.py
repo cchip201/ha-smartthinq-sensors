@@ -7,6 +7,7 @@ from copy import deepcopy
 from enum import IntEnum
 import json
 import logging
+import time
 
 from ..backports.functools import cached_property
 from ..const import StateOptions, WashDeviceFeatures
@@ -18,6 +19,8 @@ from ..device_info import DeviceInfo, DeviceType
 STATE_WM_POWER_OFF = "STATE_POWER_OFF"
 STATE_WM_INITIAL = "STATE_INITIAL"
 STATE_WM_PAUSE = "STATE_PAUSE"
+_STARTING_RUN_STATE = "Starting…"
+_STARTING_HOLD_SECONDS = 15.0
 STATE_WM_END = ["STATE_END", "STATE_COMPLETE"]
 STATE_WM_ERROR_OFF = "OFF"
 STATE_WM_ERROR_NO_ERROR = [
@@ -178,6 +181,8 @@ class WMDevice(Device):
         self._stand_by = False
         self._remote_start_status: dict | None = None
         self._remote_start_pressed = False
+        self._starting_until: float = 0.0
+        self._starting_polls_seen: int = 0
         self._power_on_available: bool = None
         self._initial_bit_start: bool = False
 
@@ -483,7 +488,6 @@ class WMDevice(Device):
 
     def get_option_value(self, option_key: str) -> str | None:
         """Return staged, selected-course default, or live display option."""
-        _ = self.select_course_enabled
         opt_map = self.get_option_map(option_key)
         if not opt_map:
             return None
@@ -512,7 +516,6 @@ class WMDevice(Device):
 
     def get_switch_option_value(self, option_key: str) -> bool:
         """Return staged, selected-course default, or live boolean state for an enum switch option."""
-        _ = self.select_course_enabled
         if override := self._option_overrides.get(option_key):
             return str(override).endswith("_ON")
 
@@ -1310,16 +1313,40 @@ class WMDevice(Device):
             return True
         return False
 
+    def _clear_starting_state(self) -> None:
+        """Clear post-Start hold tracking."""
+        self._remote_start_pressed = False
+        self._starting_until = 0.0
+        self._starting_polls_seen = 0
+
+    def _clear_staged_picks(self) -> None:
+        """Clear staged pre-start course and option selections."""
+        self._selected_course = None
+        if self._option_overrides:
+            self._option_overrides.clear()
+
+    def _refresh_status_features(self) -> None:
+        """Recompute cached WMStatus features in place after starting/staging transitions."""
+        if self._status:
+            self._status._run_state = None
+            self._status._features_updated = False
+            _ = self._status.device_features
+
+    @property
+    def is_starting(self) -> bool:
+        """Return True while holding picks and showing Starting… after Remote Start."""
+        if not self._remote_start_pressed:
+            return False
+        if time.monotonic() >= self._starting_until:
+            self._clear_starting_state()
+            self._refresh_status_features()
+            return False
+        return bool(self._status and self._status.is_on and not self.stand_by)
+
     @property
     def select_course_enabled(self) -> bool:
-        """Return if selecr course is enabled."""
-        enabled = self._initial_bit_start and self.remote_start_enabled
-        if not enabled:
-            if self._selected_course:
-                self._selected_course = None
-            if self._option_overrides:
-                self._option_overrides.clear()
-        return enabled
+        """Return if select course is enabled."""
+        return bool(self._initial_bit_start and self.remote_start_enabled)
 
     @property
     def course_display_enabled(self) -> bool:
@@ -1341,6 +1368,8 @@ class WMDevice(Device):
     def download_course_enabled(self) -> bool:
         """Return True if downloading a SmartCourse into the device slot is allowed."""
         if not (self.has_downloaded_courses and self._status and self.model_info):
+            return False
+        if self.is_starting:
             return False
         child_lock = self._status.device_features.get(WashDeviceFeatures.CHILDLOCK)
         if child_lock is None:
@@ -1554,6 +1583,8 @@ class WMDevice(Device):
         keys = self._get_cmd_keys(CMD_POWER_OFF)
         await self.set(keys[0], keys[1])
         self._remote_start_status = None
+        self._clear_starting_state()
+        self._clear_staged_picks()
         self._update_status(POWER_STATUS_KEY, self._state_power_off)
 
     async def wake_up(self):
@@ -1583,7 +1614,9 @@ class WMDevice(Device):
         keys = self._get_cmd_keys(CMD_REMOTE_START)
         await self.set(keys[0], keys[1], key=keys[2])
         self._remote_start_pressed = True
-        self._option_overrides.clear()
+        self._starting_until = time.monotonic() + _STARTING_HOLD_SECONDS
+        self._starting_polls_seen = 0
+        self._refresh_status_features()
 
     async def pause(self):
         """Pause the device."""
@@ -1592,7 +1625,7 @@ class WMDevice(Device):
 
         keys = self._get_cmd_keys(CMD_PAUSE)
         await self.set(keys[0], keys[1])
-        self._remote_start_pressed = False
+        self._clear_starting_state()
         self._update_status(POWER_STATUS_KEY, self._state_pause)
 
     async def set(
@@ -1612,14 +1645,13 @@ class WMDevice(Device):
         tcl_count = None
         if self._status:
             tcl_count = self._status.tubclean_count
+        self._clear_starting_state()
+        self._clear_staged_picks()
         self._status = WMStatus(self, tcl_count=tcl_count)
         return self._status
 
     def _set_remote_start_opt(self):
         """Save the status to use for remote start."""
-        if self._remote_start_pressed:
-            self._remote_start_pressed = False
-
         if self._power_on_available is None:
             if self.model_info.config_value("powerOnButtonAvailable"):
                 self._power_on_available = True
@@ -1649,6 +1681,28 @@ class WMDevice(Device):
         else:
             self._remote_start_status = None
             self._initial_bit_start = False
+
+        is_init_state = (
+            self._status.is_on
+            and not self._stand_by
+            and self._status.internal_run_state == self._state_power_on_init
+        )
+        if self._remote_start_pressed:
+            if (
+                is_init_state
+                and remote_start == StateOptions.ON
+                and self._starting_polls_seen < 1
+                and time.monotonic() < self._starting_until
+            ):
+                self._starting_polls_seen += 1
+            else:
+                self._clear_starting_state()
+                if not (is_init_state and remote_start == StateOptions.ON):
+                    self._clear_staged_picks()
+        elif not (is_init_state and remote_start == StateOptions.ON):
+            self._clear_staged_picks()
+
+        self._refresh_status_features()
 
     def _set_cycle_finishing(self) -> None:
         """Calculate if the cycle is finishing because remain 1 minute."""
@@ -1834,6 +1888,14 @@ class WMStatus(DeviceStatus):
     @property
     def current_course(self):
         """Return current course."""
+        if self._device.is_starting and self._device._selected_course:
+            if (
+                self._device._selected_course == self._device._download_panel_label
+                and self._device.downloaded_course
+            ):
+                return self._device.downloaded_course
+            if self._device._selected_course != _CURRENT_COURSE:
+                return self._device._selected_course
         if not (course_key := self._device.get_course_key(CourseType.COURSE)):
             return StateOptions.NONE
         dl_ap_id = (
@@ -1931,6 +1993,10 @@ class WMStatus(DeviceStatus):
     @property
     def run_state(self):
         """Return current run state."""
+        if self._device.is_starting:
+            return self._update_feature(
+                WashDeviceFeatures.RUN_STATE, _STARTING_RUN_STATE, False
+            )
         run_state = self._get_run_state()
         if STATE_WM_POWER_OFF in run_state:
             run_state = StateOptions.NONE
@@ -1971,6 +2037,10 @@ class WMStatus(DeviceStatus):
         keys = self._getkeys(["SpinSpeed", "spin"])
         if not (key := self.get_model_info_key(keys)):
             return None
+        if self._device.is_starting and (
+            staged := self._device.get_option_value("spin")
+        ):
+            return self._update_feature(WashDeviceFeatures.SPINSPEED, staged, False)
         spin_speed = self.lookup_enum(key)
         if not spin_speed:
             spin_speed = StateOptions.NONE
@@ -1984,6 +2054,10 @@ class WMStatus(DeviceStatus):
             return None
         if self.key_exist("temp") and self.is_dryer:
             return None
+        if self._device.is_starting and (
+            staged := self._device.get_option_value("temp")
+        ):
+            return self._update_feature(WashDeviceFeatures.WATERTEMP, staged, False)
         water_temp = self.lookup_enum(key)
         if not water_temp:
             water_temp = StateOptions.NONE
@@ -2006,6 +2080,10 @@ class WMStatus(DeviceStatus):
         keys = self._getkeys(["DryLevel", "dryLevel"])
         if not (key := self.get_model_info_key(keys)):
             return None
+        if self._device.is_starting and (
+            staged := self._device.get_option_value("dryLevel")
+        ):
+            return self._update_feature(WashDeviceFeatures.DRYLEVEL, staged, False)
         dry_level = self.lookup_enum(key)
         if not dry_level:
             dry_level = StateOptions.NONE
@@ -2019,6 +2097,10 @@ class WMStatus(DeviceStatus):
             return None
         if self.key_exist("temp") and not self.is_dryer:
             return None
+        if self._device.is_starting and (
+            staged := self._device.get_option_value("temp")
+        ):
+            return self._update_feature(WashDeviceFeatures.TEMPCONTROL, staged, False)
         temp_control = self.lookup_enum(key)
         if not temp_control:
             temp_control = StateOptions.NONE

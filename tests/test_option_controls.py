@@ -1041,3 +1041,84 @@ async def test_starting_timeout_and_followup_poll_reschedule(hass):
     assert washer.is_starting is False
     assert w_api.state.device_features[WashDeviceFeatures.RUN_STATE] != "Starting…"
 
+
+
+async def test_reread_remote_start_before_refusing_cycle_or_option_change(hass):
+    """Cycle, downloaded-course, option, and Start controls re-poll once before refusing on stale Remote Start cache (2156)."""
+    from custom_components.smartthinq_sensors.button import BUTTON_ENTITIES, LGEButton
+    from custom_components.smartthinq_sensors.wideq.const import StateOptions, WashDeviceFeatures
+
+    washer, client = await _make_device(
+        WASHER_OPTS_MODEL,
+        201,
+        {
+            "state": "INITIAL",
+            "preState": "INITIAL",
+            "remoteStart": "REMOTE_START_OFF",
+            "childLock": "CHILDLOCK_OFF",
+            "course": "NORMAL",
+            "smartCourse": "NOT_SELECTED",
+            "downloadCourse": "SMALL_LOAD",
+            "freshCare": "FRESHCARE_OFF",
+            "temp": "FL27_TEMP_WARM",
+            "spin": "SPIN_HIGH",
+            "soilWash": "SOILWASH_NORMAL",
+        },
+    )
+    w_api = _wrap_lge_api(hass, washer)
+    cs_sel = LGESelect(w_api, next(d for d in WASH_DEV_SELECT if d.key == "course_selection"))
+    dl_sel = LGESelect(w_api, next(d for d in WASH_DEV_SELECT if d.key == "downloaded_course"))
+    temp_sel = LGESelect(w_api, next(d for d in WASH_DEV_SELECT if d.key == "water_temp"))
+    fc_sw = LGESwitch(w_api, next(d for d in WASH_DEV_SWITCH if d.key == "fresh_care"))
+    start_btn = LGEButton(
+        w_api,
+        next(d for d in BUTTON_ENTITIES[w_api.type] if d.key == "remote_start"),
+    )
+
+    assert washer.select_course_enabled is False
+    assert washer.remote_start_enabled is False
+
+    # While Remote Start is genuinely OFF on the machine, re-poll still refuses with the clear message
+    with pytest.raises(HomeAssistantError, match="Remote Start is on at the machine"):
+        await cs_sel.async_select_option("Delicates")
+
+    # User presses Remote Start on the washer panel between 300s polls: picking a cycle right away re-polls and succeeds
+    client._snapshot["washerDryer"]["remoteStart"] = "REMOTE_START_ON"
+    await cs_sel.async_select_option("Delicates")
+    assert washer.select_course_enabled is True
+    assert washer.selected_course == "Delicates"
+    assert w_api.state.device_features[WashDeviceFeatures.REMOTESTART] == StateOptions.ON
+    assert start_btn.available is True
+
+    # Reset cached state to stale REMOTE_START_OFF and test the 2150/2156 two-step: download cycle then select Downloaded
+    client._snapshot["washerDryer"]["remoteStart"] = "REMOTE_START_OFF"
+    await washer.poll()
+    assert washer.select_course_enabled is False
+    client._snapshot["washerDryer"]["remoteStart"] = "REMOTE_START_ON"
+    await dl_sel.async_select_option("Color Care")
+    w_api.cancel_post_control_refresh()
+    assert washer.select_course_enabled is True
+    assert washer.selected_course == "Downloaded"
+    await cs_sel.async_select_option("Downloaded")
+    assert washer.selected_course == "Downloaded"
+
+    # Reset cached state to stale REMOTE_START_OFF and test option select, option switch, and Start button re-poll
+    client._snapshot["washerDryer"]["remoteStart"] = "REMOTE_START_OFF"
+    await washer.poll()
+    assert washer.select_course_enabled is False
+    client._snapshot["washerDryer"]["remoteStart"] = "REMOTE_START_ON"
+    await temp_sel.async_select_option("Hot")
+    assert temp_sel.current_option == "Hot"
+
+    client._snapshot["washerDryer"]["remoteStart"] = "REMOTE_START_OFF"
+    await washer.poll()
+    client._snapshot["washerDryer"]["remoteStart"] = "REMOTE_START_ON"
+    await fc_sw.async_turn_on()
+    assert fc_sw.is_on is True
+
+    client._snapshot["washerDryer"]["remoteStart"] = "REMOTE_START_OFF"
+    await washer.poll()
+    client._snapshot["washerDryer"]["remoteStart"] = "REMOTE_START_ON"
+    await start_btn.async_press()
+    w_api.cancel_post_control_refresh()
+    assert washer.is_starting is True

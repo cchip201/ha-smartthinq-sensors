@@ -234,6 +234,7 @@ class LGESelect(CoordinatorEntity, SelectEntity):
         try:
             await self.entity_description.select_option_fn(self._api, option)
         except InvalidDeviceStatus as exc:
+            self._api.async_set_updated()
             if str(exc):
                 raise HomeAssistantError(str(exc)) from exc
             if self.entity_description.key == "course_selection":

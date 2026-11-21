@@ -150,6 +150,7 @@ class LGEButton(CoordinatorEntity, ButtonEntity):
         try:
             await self.entity_description.press_action_fn(self._wrap_device)
         except InvalidDeviceStatus as exc:
+            self._api.async_set_updated()
             raise HomeAssistantError(
                 "Device is not ready for this action (check power and Remote Start)"
             ) from exc

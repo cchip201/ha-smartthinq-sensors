@@ -506,6 +506,8 @@ class LGEDevice:
     @callback
     def async_set_updated(self):
         """Manually update state and notify coordinator entities."""
+        if getattr(self._device, "status", None) is not None:
+            self._state = self._device.status
         if self._coordinator:
             self._coordinator.async_set_updated_data(self._state)
 

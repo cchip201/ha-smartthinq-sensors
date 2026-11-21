@@ -17,7 +17,7 @@ What it adds over upstream:
 - **LG login fix**: registers the ThinQ API v2 client id (`/service/users/client`) and retries LG error codes 9006 and 9012 on GET and POST requests.
 - **Washer and dryer cycles**: choose a downloaded cycle (SmartCourse) and start it from Home Assistant.
 - **Washer and dryer options before start**: LG option controls (select and switch entities) that can be set before a cycle starts.
-- **Washer and dryer control fixes**: the Start button is available again after a pause, the active cycle is shown while the machine is on, picks made before Start survive poll gaps, and the state reads "Starting..." after Start.
+- **Washer and dryer control fixes**: the Start button is available again after a pause, the active cycle is shown while the machine is on, pre-start cycle and option controls re-read Remote Start before refusing on stale poll cache, picks made before Start survive poll gaps, and the state reads "Starting..." after Start.
 
 Add it as a custom repository:
 

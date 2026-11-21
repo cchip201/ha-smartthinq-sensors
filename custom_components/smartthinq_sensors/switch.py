@@ -306,6 +306,7 @@ class LGESwitch(LGEBaseSwitch):
             try:
                 await self.entity_description.turn_off_fn(self._wrap_device)
             except InvalidDeviceStatus as exc:
+                self._api.async_set_updated()
                 raise HomeAssistantError(
                     str(exc) or "Option cannot be changed in the current device state"
                 ) from exc
@@ -321,6 +322,7 @@ class LGESwitch(LGEBaseSwitch):
             try:
                 await self.entity_description.turn_on_fn(self._wrap_device)
             except InvalidDeviceStatus as exc:
+                self._api.async_set_updated()
                 raise HomeAssistantError(
                     str(exc) or "Option cannot be changed in the current device state"
                 ) from exc

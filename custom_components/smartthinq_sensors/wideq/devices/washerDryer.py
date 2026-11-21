@@ -12,7 +12,14 @@ import time
 from ..backports.functools import cached_property
 from ..const import StateOptions, WashDeviceFeatures
 from ..core_async import ClientAsync
-from ..core_exceptions import InvalidDeviceStatus
+from typing import Callable
+
+from ..core_exceptions import (
+    InvalidDeviceStatus,
+    MonitorRefreshError,
+    MonitorUnavailableError,
+    NotConnectedError,
+)
 from ..device import Device, DeviceStatus
 from ..device_info import DeviceInfo, DeviceType
 
@@ -549,7 +556,7 @@ class WMDevice(Device):
         self, option_key: str, display_value: str, friendly_label: str = "Option"
     ) -> None:
         """Stage a pre-start course option to be sent on the next Remote Start."""
-        if not self.select_course_enabled:
+        if not await self._refresh_before_guard(lambda: self.select_course_enabled):
             raise InvalidDeviceStatus(
                 f"{friendly_label} can only be changed before starting when Remote Start is on at the machine"
             )
@@ -599,7 +606,7 @@ class WMDevice(Device):
         self, option_key: str, turn_on: bool, friendly_label: str = "Option"
     ) -> None:
         """Stage a pre-start boolean enum option (freshCare / wrinkleCare)."""
-        if not self.select_course_enabled:
+        if not await self._refresh_before_guard(lambda: self.select_course_enabled):
             raise InvalidDeviceStatus(
                 f"{friendly_label} can only be changed before starting when Remote Start is on at the machine"
             )
@@ -1348,6 +1355,18 @@ class WMDevice(Device):
         """Return if select course is enabled."""
         return bool(self._initial_bit_start and self.remote_start_enabled)
 
+    async def _refresh_before_guard(self, check_fn: Callable[[], bool]) -> bool:
+        """Re-poll once before a control guard refuses on stale cached state."""
+        if check_fn():
+            return True
+        if self.is_starting:
+            return False
+        try:
+            await self.poll()
+        except (MonitorRefreshError, MonitorUnavailableError, NotConnectedError):
+            return check_fn()
+        return check_fn()
+
     @property
     def course_display_enabled(self) -> bool:
         """Return True when the appliance is on so active/selected course is visible."""
@@ -1526,8 +1545,11 @@ class WMDevice(Device):
 
     async def select_downloaded_course(self, course_name: str) -> None:
         """Download a SmartCourse into the device's Downloaded slot."""
-        if not self.download_course_enabled:
-            raise InvalidDeviceStatus()
+        if not await self._refresh_before_guard(
+            lambda: self.download_course_enabled and self.select_course_enabled
+        ):
+            if not self.download_course_enabled:
+                raise InvalidDeviceStatus()
 
         smart_id = self._get_smartcourse_infos().get(course_name)
         if not smart_id:
@@ -1564,7 +1586,7 @@ class WMDevice(Device):
 
     async def select_start_course(self, course_name: str) -> None:
         """Select a secific course for remote start."""
-        if not self.select_course_enabled:
+        if not await self._refresh_before_guard(lambda: self.select_course_enabled):
             raise InvalidDeviceStatus()
 
         if course_name == _CURRENT_COURSE:
@@ -1599,7 +1621,7 @@ class WMDevice(Device):
 
     async def remote_start(self, course_name: str | None = None) -> None:
         """Remote start the device."""
-        if not self.remote_start_enabled:
+        if not await self._refresh_before_guard(lambda: self.remote_start_enabled):
             raise InvalidDeviceStatus()
 
         if course_name and self._initial_bit_start:
@@ -1620,7 +1642,7 @@ class WMDevice(Device):
 
     async def pause(self):
         """Pause the device."""
-        if not self.pause_enabled:
+        if not await self._refresh_before_guard(lambda: self.pause_enabled):
             raise InvalidDeviceStatus()
 
         keys = self._get_cmd_keys(CMD_PAUSE)

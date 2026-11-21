@@ -8,6 +8,24 @@
 
 A HomeAssistant custom integration to monitor and control LG devices using ThinQ API based on [WideQ project][wideq].
 
+## This fork
+
+This repository is a maintained fork of [ollo69/ha-smartthinq-sensors](https://github.com/ollo69/ha-smartthinq-sensors). The code, the Apache-2.0 licence and the credit stay with ollo69 and the upstream contributors; this fork keeps the same integration domain (`smartthinq_sensors`), so existing entries, entities and settings carry over. The badges and links further down this page are upstream's.
+
+What it adds over upstream:
+
+- **LG login fix**: registers the ThinQ API v2 client id (`/service/users/client`) and retries LG error codes 9006 and 9012 on GET and POST requests.
+- **Washer and dryer cycles**: choose a downloaded cycle (SmartCourse) and start it from Home Assistant.
+- **Washer and dryer options before start**: LG option controls (select and switch entities) that can be set before a cycle starts.
+- **Washer and dryer control fixes**: the Start button is available again after a pause, the active cycle is shown while the machine is on, picks made before Start survive poll gaps, and the state reads "Starting..." after Start.
+
+Add it as a custom repository:
+
+- **Home Assistant 2026.11 and newer** (Marketplace): open **Settings** > **Marketplace** > **Add from link**, enter `https://github.com/cchip201/ha-smartthinq-sensors`, select **Add** (pick the type **Integration** if it asks), then install **SmartThinQ LGE Sensors** and restart Home Assistant.
+- **Home Assistant 2026.10 and older** (HACS): open HACS, then the three-dot menu > **Custom repositories**, enter `https://github.com/cchip201/ha-smartthinq-sensors`, type **Integration**, select **Add**, then download **SmartThinQ LGE Sensors** and restart Home Assistant.
+
+This fork and upstream install into the same folder (`custom_components/smartthinq_sensors`), so use one of them, not both. Report problems with this fork in its [issues](https://github.com/cchip201/ha-smartthinq-sensors/issues).
+
 Supported devices are:
 
 - Air Conditioner
